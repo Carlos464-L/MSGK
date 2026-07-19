@@ -1,0 +1,1848 @@
+---
+title: "Untitled"
+author: "Carlos"
+date: "2026-04-15"
+output: pdf_document
+---
+
+
+```{r setup,include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,error = F, message = F, warning = F,comment = "")
+```
+
+
+```{r}
+
+rm(list = ls())
+library(BGLR)
+library(readr)
+library(nortest)
+library(coda)
+library(moments)
+library(HDInterval)
+
+setwd("C:/Users/karre/Downloads/GBLUP-R-Rendimiento")
+
+Dat <- read.csv("Conventional_Long_Traits_2018_24_Shared_updatedwithchecks_FINALCLEANED.csv",
+  header = FALSE, stringsAsFactors = FALSE)
+
+load("C:/Users/karre/Downloads/X.RData")
+
+
+
+```
+
+
+```{r,echo=FALSE,include=FALSE}
+# Aqui elimino la fila que contiene encabezado.
+Dat <- Dat[Dat$V1 != "germplasmName", ]
+
+```
+
+
+# 24
+```{r}
+# =========================================================
+# 1. Filtrar Datos: Predecir 2024 
+# =========================================================
+Ren <- Dat[Dat$V7 == "Yield.LSU_01.0000138", ]
+
+# Entrenamiento: Años históricos (2018-2023)
+R_train <- Ren[Ren$V6 %in% 2018:2023, ]
+# Test: El futuro (2024)
+R_test  <- Ren[Ren$V6 == 2024, ]
+
+# =========================================================
+# 2. Fenotipos y IDs (Sincronización Cruda)
+# =========================================================
+y_train_raw <- as.numeric(R_train$V5)/1000
+y_test_raw  <- as.numeric(R_test$V5)/1000
+
+id_train_raw <- trimws(as.character(R_train$V1))
+id_test_raw  <- trimws(as.character(R_test$V1))
+
+# Identificar quiénes SÍ tienen datos en la matriz X
+keep_train <- id_train_raw %in% rownames(X)
+keep_test  <- id_test_raw  %in% rownames(X)
+
+# Filtrado sincronizado de IDs y Fenotipos
+id_train <- id_train_raw[keep_train]
+id_test  <- id_test_raw[keep_test]
+
+y_train <- y_train_raw[keep_train]
+y_test  <- y_test_raw[keep_test]
+
+# Extraer Matrices X
+X_train <- X[id_train, , drop = FALSE]
+X_test  <- X[id_test, , drop = FALSE]
+
+# =========================================================
+# 3. Construcción de Matrices de Relación (GBLUP)
+# =========================================================
+# 1. Centra el entrenamiento 
+mu_train <- colMeans(X_train)
+Xc_train <- scale(X_train, center = mu_train, scale = FALSE)
+
+# 2. Centra el test usando EL MISMO centro del entrenamiento
+Xc_test  <- scale(X_test, center = mu_train, scale = FALSE)
+
+# 3. Crea Matrices K (Relación Genómica)
+K_train      <- tcrossprod(Xc_train) / ncol(Xc_train)
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 4. Ajuste del Modelo BGLR (RKHS)
+
+#year_train <- factor(R_train$V6[keep_train])
+
+#X_year <- model.matrix(~ year_train)[, -1, drop = FALSE]
+
+
+
+year_train <- factor(R_train$V6[keep_train])
+X_year <- model.matrix(~ 0 + year_train)
+
+# Crear matriz de incidencia para efectos aleatorios (Simetría total)
+
+
+ETA <- list(
+  ENV = list(X = X_year, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS")
+)
+
+
+# =========================================================
+#ETA <- list(list(K = K_train, model = "RKHS"))
+
+set.seed(12)
+fm_R <- BGLR(y = y_train, ETA = ETA, nIter = 55000, burnIn = 40000, 
+             saveAt = "pred24_c1_", verbose = FALSE)
+
+set.seed(13)
+fm2_R <- BGLR(y = y_train, ETA = ETA, nIter = 55000, burnIn = 40000, 
+              saveAt = "pred24_c2_", verbose = FALSE)
+str(fm_R)
+# =========================================================
+# 5. Predicción para 2024
+# =========================================================
+library(MASS)
+
+# Promedio de las dos cadenas (Ensemble)
+u_hat_train <- (fm_R$ETA[[2]]$u + fm2_R$ETA[[2]]$u) / 2
+
+#u_hat_train <- (fm_R$ETA[[1]]$u + fm2_R$ETA[[1]]$u) / 2
+mu_hat      <- (fm_R$mu + fm2_R$mu) / 2
+
+
+# BLUP para el año 2024 (Test) usando la matriz cruzada
+u_hat_2024<- K_test_train %*% ginv(K_train) %*% u_hat_train
+pred_2024_total <- as.vector(u_hat_2024 + mu_hat)
+#########################################################################################################################################################
+
+SelectionStatistics <- function(y_test,pred_2024_total,p=0.10){
+
+    datos <- data.frame(
+        Observed=y_test,
+        Predicted=pred_2024_total
+    )
+
+    datos <- datos[
+        order(datos$Predicted,decreasing=TRUE),
+    ]
+
+    nTop <- ceiling(p*nrow(datos))
+
+    top <- datos[1:nTop,]
+
+    MeanPopulation <- mean(datos$Observed)
+
+    MeanTop <- mean(top$Observed)
+
+    SD <- MeanTop-MeanPopulation
+
+    SDpercent <- 100*SD/MeanPopulation
+
+    list(
+        MeanPopulation=MeanPopulation,
+        MeanTop=MeanTop,
+        SelectionDifferential=SD,
+        SelectionDifferentialPercent=SDpercent,
+        TopIndividuals=top
+    )
+}
+
+GBLUP <- SelectionStatistics(y_test,pred_2024_total)
+
+GBLUP$TopIndividuals
+
+
+
+# =========================================================
+# 6. Resultados y Gráfico
+# =========================================================
+cor_2024 <- cor(y_test, pred_2024_total, use = "complete.obs")
+rmse_2024 <- sqrt(mean((y_test - pred_2024_total)^2))
+
+cat("\n--- RESULTADOS GBLUP 2024 ---\n")
+cat("Correlación:", round(cor_2024, 4), "\n")
+cat("RMSE:", round(rmse_2024, 4), "\n")
+
+plot(y_test, pred_2024_total, col = "red", pch = 19,
+     xlab = "Observado 2024", ylab = "Predicho GBLUP",
+     main = paste("GBLUP 2024 - Cor:", round(cor_2024, 3)))
+abline(0, 1, col = "blue", lwd = 2, lty = 2)
+
+
+
+
+
+
+
+
+
+
+
+png("GBLUP_Validation_2024_HD.png", 
+    width = 1800, height = 1800, res = 300) 
+
+# 2. Configurar parámetros gráficos: pty="s" asegura que sea cuadrado
+par(pty = "s", mar = c(5, 5, 4, 2)) 
+
+# 3. Crear el gráfico base (IMPORTANTE: axes = FALSE)
+plot(y_test, pred_2024_total, 
+     xlab = "Observed ",   
+     ylab = "Predicted ",  
+     pch = 19, 
+     col = "darkred",
+     cex.lab = 1.1,    
+     axes = FALSE) # Esto permite que luego definamos los ejes a mano
+
+# 4. Dibujar los ejes de forma remarcada
+axis(1, lwd = 2) # Eje X con línea gruesa
+axis(2, lwd = 2) # Eje Y con línea gruesa
+
+# 5. Añadir la caja en forma de "L" (remarca los ejes X e Y)
+box(bty = "l", lwd = 2)
+
+# 6. Añadir la línea de referencia 1:1 (discontinua)
+abline(0, 1, col = "blue", lwd = 2, lty = 2)
+
+# 7. Cerrar y guardar el archivo
+dev.off()
+
+cat("Imagen generada exitosamente en tu carpeta de trabajo.")
+```
+
+
+
+
+
+# Posterior
+```{r}
+# =========================================================
+
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("pred24_c1_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("pred24_c2_", pattern), quiet = TRUE)
+  
+ 
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+str(fm_R)
+
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+params_list <- list(mu_mcmc, u_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean", "Trace_VarG", "Trace_VarE", "Trace_VarEnv")
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# =========================================================
+# 3. BUCLE PARA GUARDAR TRAZAS HD
+# =========================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  # Doble corchete para la expresión
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+#HDI
+
+```{r}
+# =========================================================
+# 5. HDI ANALYSIS (CORRECTED FOR FULL CHAINS)
+# =========================================================
+library(HDInterval)
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+e_real_chain   <- e_com 
+env_real_chain   <- env_com 
+
+h2_chain <- (mu_com + u_com+env_com ) / (mu_com + u_com + env_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+
+
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN 
+# =========================================================
+library(coda)
+
+# Calcular el diagnóstico para cada parámetro
+# Un valor cercano a 1.00 (ej. < 1.1) indica buena convergencia
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env <- gelman.diag(env_mcmc)
+
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+   `Variance Env`         = gr_env$psrf[1, ]
+)
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+
+
+# 23
+
+```{r}
+
+Ren <- Dat[Dat$V7 == "Yield.LSU_01.0000138", ]
+
+R_train <- Ren[Ren$V6 %in% c(2018, 2019, 2020, 2021, 2022, 2024), ]
+# Test: Solo el año 2023
+R_test  <- Ren[Ren$V6 == 2023, ]
+
+# =========================================================
+# 2. Fenotipos y IDs
+# =========================================================
+y_train_raw <- as.numeric(R_train$V5)/1000
+y_test_raw  <- as.numeric(R_test$V5)/1000
+
+id_train_raw <- trimws(as.character(R_train$V1))
+id_test_raw  <- trimws(as.character(R_test$V1))
+
+# Sincronización con Matriz X
+keep_train <- id_train_raw %in% rownames(X)
+keep_test  <- id_test_raw  %in% rownames(X)
+
+id_train <- id_train_raw[keep_train]
+id_test  <- id_test_raw[keep_test]
+
+y_train <- y_train_raw[keep_train]
+y_test  <- y_test_raw[keep_test]
+
+# Matrices X
+X_train <- X[id_train, , drop = FALSE]
+X_test  <- X[id_test, , drop = FALSE]
+
+# =========================================================
+# 3. Construcción de Matrices de Relación (GBLUP)
+# =========================================================
+# Centrar entrenamiento y guardar mu para el test
+mu_train <- colMeans(X_train)
+Xc_train <- scale(X_train, center = mu_train, scale = FALSE)
+Xc_test  <- scale(X_test, center = mu_train, scale = FALSE)
+
+# Matriz K entrenamiento
+K_train <- tcrossprod(Xc_train) / ncol(Xc_train)
+# Matriz K test-train
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 4. Ajuste del Modelo BGLR (RKHS)
+
+#year_train <- factor(R_train$V6[keep_train])
+
+#X_year <- model.matrix(~ year_train)[, -1, drop = FALSE]
+
+
+year_train <- factor(R_train$V6[keep_train])
+X_year <- model.matrix(~ 0 + year_train)
+
+
+
+ETA <- list(
+  ENV = list(X = X_year, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS")
+)
+# =========================================================
+#ETA <- list(list(K = K_train, model = "RKHS"))
+
+set.seed(12)
+fm_R <- BGLR(y = y_train, ETA = ETA, nIter = 70000, burnIn = 55000, 
+             saveAt = "pred23_c1_", verbose = FALSE)
+
+set.seed(13)
+fm2_R <- BGLR(y = y_train, ETA = ETA, nIter = 70000, burnIn = 55000, 
+              saveAt = "pred23_c2_", verbose = FALSE)
+
+
+
+str(fm_R)
+# =========================================================
+# 5. Predicción para 2023
+# =========================================================
+library(MASS)
+
+# Promedio de efectos aleatorios y media global
+
+u_hat_train <- (fm_R$ETA[[2]]$u + fm2_R$ETA[[2]]$u) / 2
+
+#u_hat_train <- (fm_R$ETA[[1]]$u + fm2_R$ETA[[1]]$u) / 2
+mu_hat      <- (fm_R$mu + fm2_R$mu) / 2
+
+# BLUP para el año 2023 (Test)
+u_hat_2023      <- K_test_train %*% ginv(K_train) %*% u_hat_train
+pred_2023_total <- as.vector(u_hat_2023 + mu_hat)
+
+# =========================================================
+# 6. Resultados y Gráfico
+# =========================================================
+cor_2023 <- cor(y_test, pred_2023_total, use = "complete.obs")
+rmse_2023 <- sqrt(mean((y_test - pred_2023_total)^2))
+
+cat("Correlación 2023:", round(cor_2023, 4), "\n")
+cat("RMSE 2023:", round(rmse_2023, 4), "\n")
+
+plot(y_test, pred_2023_total, col = "blue", pch = 19,
+     xlab = "Observado 2023", ylab = "Predicho GBLUP",
+     main = paste("Predicción 2023 - Cor:", round(cor_2023, 3)))
+abline(0, 1, col = "red", lwd = 2, lty = 2)
+```
+
+# Posterior
+```{r}
+# =========================================================
+
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("pred23_c1_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("pred23_c2_", pattern), quiet = TRUE)
+  
+ 
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+str(fm_R)
+
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+params_list <- list(mu_mcmc, u_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean", "Trace_VarG", "Trace_VarE", "Trace_VarEnv")
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# =========================================================
+# 3. BUCLE PARA GUARDAR TRAZAS HD
+# =========================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  # Doble corchete para la expresión
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+#HDI
+
+```{r}
+# =========================================================
+# 5. HDI ANALYSIS (CORRECTED FOR FULL CHAINS)
+# =========================================================
+library(HDInterval)
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+e_real_chain   <- e_com 
+env_real_chain   <- env_com 
+
+h2_chain <- (mu_com + u_com+env_com ) / (mu_com + u_com + env_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+
+
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN 
+# =========================================================
+library(coda)
+
+# Calcular el diagnóstico para cada parámetro
+# Un valor cercano a 1.00 (ej. < 1.1) indica buena convergencia
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env <- gelman.diag(env_mcmc)
+
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+   `Variance Env`         = gr_env$psrf[1, ]
+)
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+
+
+# 2022
+
+```{r}
+
+Ren <- Dat[Dat$V7 == "Yield.LSU_01.0000138", ]
+
+
+R_train <- Ren[Ren$V6 %in% c(2018, 2019, 2020, 2021, 2023, 2024), ]
+
+R_test  <- Ren[Ren$V6 == 2022, ]
+# =========================================================
+y_train_raw <- as.numeric(R_train$V5)/1000
+y_test_raw  <- as.numeric(R_test$V5)/1000
+
+id_train_raw <- trimws(as.character(R_train$V1))
+id_test_raw  <- trimws(as.character(R_test$V1))
+
+# Sincronización con Matriz X
+keep_train <- id_train_raw %in% rownames(X)
+keep_test  <- id_test_raw  %in% rownames(X)
+
+id_train <- id_train_raw[keep_train]
+id_test  <- id_test_raw[keep_test]
+
+y_train <- y_train_raw[keep_train]
+y_test  <- y_test_raw[keep_test]
+
+# Matrices X
+X_train <- X[id_train, , drop = FALSE]
+X_test  <- X[id_test, , drop = FALSE]
+
+# =========================================================
+# Construcción de Matrices de Relación (GBLUP)
+
+mu_train <- colMeans(X_train)
+Xc_train <- scale(X_train, center = mu_train, scale = FALSE)
+Xc_test  <- scale(X_test, center = mu_train, scale = FALSE)
+
+# Matriz K entrenamiento
+K_train <- tcrossprod(Xc_train) / ncol(Xc_train)
+# Matriz K test-train
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 4. Ajuste del Modelo BGLR (RKHS)
+year_train <- factor(R_train$V6[keep_train])
+X_year <- model.matrix(~ 0 + year_train)
+
+ETA <- list(
+  ENV = list(X = X_year, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS")
+)
+# =========================================================
+#ETA <- list(list(K = K_train, model = "RKHS"))
+
+set.seed(12)
+fm_R <- BGLR(y = y_train, ETA = ETA, nIter = 75000, burnIn = 55000, 
+             saveAt = "pred22_c1_", verbose = TRUE)
+
+set.seed(13)
+fm2_R <- BGLR(y = y_train, ETA = ETA, nIter = 75000, burnIn = 55000, 
+              saveAt = "pred22_c2_", verbose = TRUE)
+
+# =========================================================
+# =========================================================
+library(MASS)
+
+# Promedio de efectos aleatorios y media global
+u_hat_train <- (fm_R$ETA[[2]]$u + fm2_R$ETA[[2]]$u) / 2
+mu_hat      <- (fm_R$mu + fm2_R$mu) / 2
+
+u_hat_2022      <- K_test_train %*% ginv(K_train) %*% u_hat_train
+pred_2022_total <- as.vector(u_hat_2022 + mu_hat)
+
+
+# =========================================================
+# 6. Resultados y Gráfico
+# =========================================================
+cor_2022 <- cor(y_test, pred_2022_total, use = "complete.obs")
+rmse_2022 <- sqrt(mean((y_test - pred_2022_total)^2))
+
+cat("Correlación 2022:", round(cor_2022, 4), "\n")
+cat("RMSE 2022:", round(rmse_2022, 4), "\n")
+
+plot(y_test, pred_2022_total, col = "blue", pch = 19,
+     xlab = "Observado 2022", ylab = "Predicho GBLUP",
+     main = paste("Predicción 2022 - Cor:", round(cor_2022, 3)))
+abline(0, 1, col = "red", lwd = 2, lty = 2)
+```
+
+
+# Posterior
+```{r}
+# =========================================================
+
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("pred22_c1_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("pred22_c2_", pattern), quiet = TRUE)
+  
+ 
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+str(fm_R)
+
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+params_list <- list(mu_mcmc, u_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean", "Trace_VarG", "Trace_VarE", "Trace_VarEnv")
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# =========================================================
+# 3. BUCLE PARA GUARDAR TRAZAS HD
+# =========================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  # Doble corchete para la expresión
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+#HDI
+
+```{r}
+# =========================================================
+# 5. HDI ANALYSIS (CORRECTED FOR FULL CHAINS)
+# =========================================================
+library(HDInterval)
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+e_real_chain   <- e_com 
+env_real_chain   <- env_com 
+
+h2_chain <- (mu_com + u_com+env_com ) / (mu_com + u_com + env_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+
+
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN 
+# =========================================================
+library(coda)
+
+# Calcular el diagnóstico para cada parámetro
+# Un valor cercano a 1.00 (ej. < 1.1) indica buena convergencia
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env <- gelman.diag(env_mcmc)
+
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+   `Variance Env`         = gr_env$psrf[1, ]
+)
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+
+
+
+# 2021
+
+```{r}
+
+Ren <- Dat[Dat$V7 == "Yield.LSU_01.0000138", ]
+
+R_train <- Ren[Ren$V6 %in% c(2018, 2019, 2020, 2022, 2023, 2024), ]
+R_test  <- Ren[Ren$V6 == 2021, ]
+
+y_train_raw <- as.numeric(R_train$V5)/1000
+y_test_raw  <- as.numeric(R_test$V5)/1000
+
+id_train_raw <- trimws(as.character(R_train$V1))
+id_test_raw  <- trimws(as.character(R_test$V1))
+
+
+keep_train <- id_train_raw %in% rownames(X)
+keep_test  <- id_test_raw  %in% rownames(X)
+
+id_train <- id_train_raw[keep_train]
+id_test  <- id_test_raw[keep_test]
+
+y_train <- y_train_raw[keep_train]
+y_test  <- y_test_raw[keep_test]
+
+
+X_train <- X[id_train, , drop = FALSE]
+X_test  <- X[id_test, , drop = FALSE]
+
+
+mu_train <- colMeans(X_train)
+Xc_train <- scale(X_train, center = mu_train, scale = FALSE)
+Xc_test  <- scale(X_test, center = mu_train, scale = FALSE)
+
+# Matriz K entrenamiento
+K_train <- tcrossprod(Xc_train) / ncol(Xc_train)
+# Matriz K test-train
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 4. Ajuste del Modelo BGLR (RKHS)
+year_train <- factor(R_train$V6[keep_train])
+X_year <- model.matrix(~ 0 + year_train)
+
+ETA <- list(
+  ENV = list(X = X_year, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS")
+)
+# =========================================================
+#ETA <- list(list(K = K_train, model = "RKHS"))
+
+set.seed(12)
+fm_R <- BGLR(y = y_train, ETA = ETA, nIter = 75000, burnIn = 50000, 
+             saveAt = "pred21_c1_", verbose = FALSE)
+
+set.seed(13)
+fm2_R <- BGLR(y = y_train, ETA = ETA, nIter = 75000, burnIn = 50000, 
+              saveAt = "pred21_c2_", verbose = FALSE)
+
+# =========================================================
+# 5. Predicción 
+# =========================================================
+library(MASS)
+
+# Promedio de efectos aleatorios y media global
+u_hat_train <- (fm_R$ETA[[2]]$u + fm2_R$ETA[[2]]$u) / 2
+mu_hat      <- (fm_R$mu + fm2_R$mu) / 2
+
+# BLUP para el año 2021 (Test)
+u_hat_2021      <- K_test_train %*% ginv(K_train) %*% u_hat_train
+pred_2021_total <- as.vector(u_hat_2021 + mu_hat)
+
+
+# =========================================================
+# 6. Resultados y Gráfico
+# =========================================================
+cor_2021 <- cor(y_test, pred_2021_total, use = "complete.obs")
+rmse_2021 <- sqrt(mean((y_test - pred_2021_total)^2))
+
+cat("Correlación 2021:", round(cor_2021, 4), "\n")
+cat("RMSE 2021:", round(rmse_2021, 4), "\n")
+
+plot(y_test, pred_2021_total, col = "blue", pch = 19,
+     xlab = "Observado 2021", ylab = "Predicho GBLUP",
+     main = paste("Predicción 2021 - Cor:", round(cor_2021, 3)))
+abline(0, 1, col = "red", lwd = 2, lty = 2)
+```
+
+
+# Posterior
+```{r}
+# =========================================================
+
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("pred21_c1_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("pred21_c2_", pattern), quiet = TRUE)
+  
+ 
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+str(fm_R)
+
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+params_list <- list(mu_mcmc, u_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean", "Trace_VarG", "Trace_VarE", "Trace_VarEnv")
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# =========================================================
+# 3. BUCLE PARA GUARDAR TRAZAS HD
+# =========================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  # Doble corchete para la expresión
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+# HDI
+
+```{r}
+# =========================================================
+# 5. HDI ANALYSIS (CORRECTED FOR FULL CHAINS)
+# =========================================================
+library(HDInterval)
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+e_real_chain   <- e_com 
+env_real_chain   <- env_com 
+
+h2_chain <- (mu_com + u_com+env_com ) / (mu_com + u_com + env_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+
+
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN 
+# =========================================================
+library(coda)
+
+# Calcular el diagnóstico para cada parámetro
+# Un valor cercano a 1.00 (ej. < 1.1) indica buena convergencia
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env <- gelman.diag(env_mcmc)
+
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+   `Variance Env`         = gr_env$psrf[1, ]
+)
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+
+# 2020
+
+
+```{r}
+Ren <- Dat[Dat$V7 == "Yield.LSU_01.0000138", ]
+
+
+R_train <- Ren[Ren$V6 %in% c(2018, 2019, 2021, 2022, 2023, 2024), ]
+
+R_test  <- Ren[Ren$V6 == 2020, ]
+
+
+y_train_raw <- as.numeric(R_train$V5)/1000
+y_test_raw  <- as.numeric(R_test$V5)/1000
+
+id_train_raw <- trimws(as.character(R_train$V1))
+id_test_raw  <- trimws(as.character(R_test$V1))
+
+
+keep_train <- id_train_raw %in% rownames(X)
+keep_test  <- id_test_raw  %in% rownames(X)
+
+id_train <- id_train_raw[keep_train]
+id_test  <- id_test_raw[keep_test]
+
+y_train <- y_train_raw[keep_train]
+y_test  <- y_test_raw[keep_test]
+
+
+X_train <- X[id_train, , drop = FALSE]
+X_test  <- X[id_test, , drop = FALSE]
+
+
+mu_train <- colMeans(X_train)
+Xc_train <- scale(X_train, center = mu_train, scale = FALSE)
+Xc_test  <- scale(X_test, center = mu_train, scale = FALSE)
+
+K_train <- tcrossprod(Xc_train) / ncol(Xc_train)
+
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 4. Ajuste del Modelo BGLR (RKHS)
+year_train <- factor(R_train$V6[keep_train])
+X_year <- model.matrix(~ 0 + year_train)
+
+ETA <- list(
+  ENV = list(X = X_year, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS")
+)
+# =========================================================
+#ETA <- list(list(K = K_train, model = "RKHS"))
+
+set.seed(12)
+fm_R <- BGLR(y = y_train, ETA = ETA, nIter = 75000, burnIn = 50000, 
+             saveAt = "pred20_c1_", verbose = FALSE)
+
+set.seed(13)
+fm2_R <- BGLR(y = y_train, ETA = ETA, nIter = 75000, burnIn = 50000, 
+              saveAt = "pred20_c2_", verbose = FALSE)
+
+
+library(MASS)
+
+u_hat_train <- (fm_R$ETA[[2]]$u + fm2_R$ETA[[2]]$u) / 2
+mu_hat      <- (fm_R$mu + fm2_R$mu) / 2
+
+
+u_hat_2020      <- K_test_train %*% ginv(K_train) %*% u_hat_train
+pred_2020_total <- as.vector(u_hat_2020 + mu_hat)
+
+
+
+# =========================================================
+cor_2020 <- cor(y_test, pred_2020_total, use = "complete.obs")
+rmse_2020 <- sqrt(mean((y_test - pred_2020_total)^2))
+
+cat("Correlación 2020:", round(cor_2020, 4), "\n")
+cat("RMSE 2020:", round(rmse_2020, 4), "\n")
+
+
+```
+
+# Posterior
+```{r}
+# =========================================================
+
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("pred20_c1_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("pred20_c2_", pattern), quiet = TRUE)
+  
+ 
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+str(fm_R)
+
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+params_list <- list(mu_mcmc, u_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean", "Trace_VarG", "Trace_VarE", "Trace_VarEnv")
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# =========================================================
+# 3. BUCLE PARA GUARDAR TRAZAS HD
+# =========================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  # Doble corchete para la expresión
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+# HDI
+
+```{r}
+# =========================================================
+# 5. HDI ANALYSIS (CORRECTED FOR FULL CHAINS)
+# =========================================================
+library(HDInterval)
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+e_real_chain   <- e_com 
+env_real_chain   <- env_com 
+
+h2_chain <- (mu_com + u_com+env_com ) / (mu_com + u_com + env_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+
+
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN 
+# =========================================================
+library(coda)
+
+# Calcular el diagnóstico para cada parámetro
+# Un valor cercano a 1.00 (ej. < 1.1) indica buena convergencia
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env <- gelman.diag(env_mcmc)
+
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+   `Variance Env`         = gr_env$psrf[1, ]
+)
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+# 19
+
+```{r}
+Ren <- Dat[Dat$V7 == "Yield.LSU_01.0000138", ]
+
+R_train <- Ren[Ren$V6 %in% c(2018, 2020, 2021, 2022, 2023, 2024), ]
+
+R_test  <- Ren[Ren$V6==2019,]
+
+y_train_raw <- as.numeric(R_train$V5)/1000
+y_test_raw  <- as.numeric(R_test$V5)/1000
+
+id_train_raw <- trimws(as.character(R_train$V1))
+id_test_raw  <- trimws(as.character(R_test$V1))
+
+keep_train <- id_train_raw %in% rownames(X)
+keep_test  <- id_test_raw  %in% rownames(X)
+
+id_train <- id_train_raw[keep_train]
+id_test  <- id_test_raw[keep_test]
+
+y_train <- y_train_raw[keep_train]
+y_test  <- y_test_raw[keep_test]
+
+X_train <- X[id_train, , drop = FALSE]
+X_test  <- X[id_test, , drop = FALSE]
+
+
+mu_train <- colMeans(X_train)
+Xc_train <- scale(X_train, center = mu_train, scale = FALSE)
+Xc_test  <- scale(X_test, center = mu_train, scale = FALSE)
+
+
+K_train <- tcrossprod(Xc_train) / ncol(Xc_train)
+
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+year_train <- factor(R_train$V6[keep_train])
+X_year <- model.matrix(~ 0 + year_train)
+
+ETA <- list(
+  ENV = list(X = X_year, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS")
+)
+#ETA <- list(list(K = K_train, model = "RKHS"))
+
+set.seed(12)
+fm_R <- BGLR(y = y_train, ETA = ETA, nIter = 75000, burnIn = 50000, 
+             saveAt = "pred19_c1_", verbose = FALSE)
+
+set.seed(13)
+fm2_R <- BGLR(y = y_train, ETA = ETA, nIter = 75000, burnIn = 50000, 
+              saveAt = "pred19_c2_", verbose = FALSE)
+
+library(MASS)
+
+u_hat_train <- (fm_R$ETA[[2]]$u + fm2_R$ETA[[2]]$u) / 2
+mu_hat      <- (fm_R$mu + fm2_R$mu) / 2
+
+u_hat_2019      <- K_test_train %*% ginv(K_train) %*% u_hat_train
+pred_2019_total <- as.vector(u_hat_2019 + mu_hat)
+
+
+
+cor_2019 <- cor(y_test, pred_2019_total, use = "complete.obs")
+rmse_2019 <- sqrt(mean((y_test - pred_2019_total)^2))
+
+cat("Correlación 2019:", round(cor_2019, 4), "\n")
+cat("RMSE 2019:", round(rmse_2019, 4), "\n")
+
+
+```
+
+
+# Posterior
+```{r}
+# =========================================================
+
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("pred19_c1_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("pred19_c2_", pattern), quiet = TRUE)
+  
+ 
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+str(fm_R)
+
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+params_list <- list(mu_mcmc, u_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean", "Trace_VarG", "Trace_VarE", "Trace_VarEnv")
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# =========================================================
+# 3. BUCLE PARA GUARDAR TRAZAS HD
+# =========================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  # Doble corchete para la expresión
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+# HDI
+
+```{r}
+# =========================================================
+# 5. HDI ANALYSIS (CORRECTED FOR FULL CHAINS)
+# =========================================================
+library(HDInterval)
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+e_real_chain   <- e_com 
+env_real_chain   <- env_com 
+
+h2_chain <- (mu_com + u_com+env_com ) / (mu_com + u_com + env_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+
+
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN 
+# =========================================================
+library(coda)
+
+# Calcular el diagnóstico para cada parámetro
+# Un valor cercano a 1.00 (ej. < 1.1) indica buena convergencia
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env <- gelman.diag(env_mcmc)
+
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+   `Variance Env`         = gr_env$psrf[1, ]
+)
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+
+
+
+
+
+# 2018
+
+```{r}
+Ren <- Dat[Dat$V7 == "Yield.LSU_01.0000138", ]
+R_train <- Ren[Ren$V6 %in% c(2019, 2020, 2021, 2022, 2023, 2024), ]
+
+R_test  <- Ren[Ren$V6==2018,]
+
+y_train_raw <- as.numeric(R_train$V5)/1000
+y_test_raw  <- as.numeric(R_test$V5)/1000
+
+id_train_raw <- trimws(as.character(R_train$V1))
+id_test_raw  <- trimws(as.character(R_test$V1))
+
+keep_train <- id_train_raw %in% rownames(X)
+keep_test  <- id_test_raw  %in% rownames(X)
+
+id_train <- id_train_raw[keep_train]
+id_test  <- id_test_raw[keep_test]
+
+y_train <- y_train_raw[keep_train]
+y_test  <- y_test_raw[keep_test]
+
+X_train <- X[id_train, , drop = FALSE]
+X_test  <- X[id_test, , drop = FALSE]
+
+mu_train <- colMeans(X_train)
+Xc_train <- scale(X_train, center = mu_train, scale = FALSE)
+Xc_test  <- scale(X_test, center = mu_train, scale = FALSE)
+
+
+K_train <- tcrossprod(Xc_train) / ncol(Xc_train)
+
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+##########################################
+year_train <- factor(R_train$V6[keep_train])
+X_year <- model.matrix(~ 0 + year_train)
+
+ETA <- list(
+  ENV = list(X = X_year, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS")
+)
+#ETA <- list(list(K = K_train, model = "RKHS"))
+
+set.seed(12)
+fm_R <- BGLR(y = y_train, ETA = ETA, nIter = 75000, burnIn = 55000, 
+             saveAt = "pred18_c1_", verbose = FALSE)
+
+set.seed(13)
+fm2_R <- BGLR(y = y_train, ETA = ETA, nIter = 75000, burnIn = 55000, 
+              saveAt = "pred18_c2_", verbose = FALSE)
+
+library(MASS)
+
+u_hat_train <- (fm_R$ETA[[2]]$u + fm2_R$ETA[[2]]$u) / 2
+mu_hat  <- (fm_R$mu + fm2_R$mu) / 2
+
+
+u_hat_2018      <- K_test_train %*% ginv(K_train) %*% u_hat_train
+pred_2018_total <- as.vector(u_hat_2018 + mu_hat)
+
+
+cor_2018 <- cor(y_test, pred_2018_total, use = "complete.obs")
+rmse_2018 <- sqrt(mean((y_test - pred_2018_total)^2))
+
+cat("Correlación 2018:", round(cor_2018, 4), "\n")
+cat("RMSE 2018:", round(rmse_2018, 4), "\n")
+
+
+```
+
+
+# Posterior
+```{r}
+# =========================================================
+
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("pred18_c1_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("pred18_c2_", pattern), quiet = TRUE)
+  
+ 
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+str(fm_R)
+
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+params_list <- list(mu_mcmc, u_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean", "Trace_VarG", "Trace_VarE", "Trace_VarEnv")
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# =========================================================
+# 3. BUCLE PARA GUARDAR TRAZAS HD
+# =========================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  # Doble corchete para la expresión
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+#HDI
+
+```{r}
+# =========================================================
+# 5. HDI ANALYSIS (CORRECTED FOR FULL CHAINS)
+# =========================================================
+library(HDInterval)
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+e_real_chain   <- e_com 
+env_real_chain   <- env_com 
+
+h2_chain <- (mu_com + u_com+env_com ) / (mu_com + u_com + env_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+
+
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN 
+# =========================================================
+library(coda)
+
+# Calcular el diagnóstico para cada parámetro
+# Un valor cercano a 1.00 (ej. < 1.1) indica buena convergencia
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env <- gelman.diag(env_mcmc)
+
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+   `Variance Env`         = gr_env$psrf[1, ]
+)
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+

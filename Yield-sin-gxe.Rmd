@@ -1,0 +1,2616 @@
+---
+title: "Untitled"
+author: "Carlos"
+date: "2026-03-22"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 3 cadenas 2024
+
+```{r}
+rm(list = ls())
+library(BGLR)
+library(MASS)
+
+setwd("C:/Users/karre/Downloads/MSGK-Articulo-R-ren-singxe")
+
+# =========================================================
+# 1. Cargar datos
+# =========================================================
+Dat <- read.csv("Conventional_Long_Traits_2018_24_Shared_updatedwithchecks_FINALCLEANED.csv",
+                header = TRUE, stringsAsFactors = FALSE)
+
+load("X.RData")
+
+allelo <- read.csv("snp_agriplex_2039_Coventional_Long (1).csv",
+                   stringsAsFactors = FALSE)
+
+# =========================================================
+# 2. Filtrar rasgo
+# =========================================================
+Ren <- Dat[Dat$Trait == "Yield.LSU_01.0000138", ]
+Ren$germplasmName <- trimws(as.character(Ren$germplasmName))
+
+R_train <- Ren[Ren$studyYear %in% 2018:2023, ]
+R_test  <- Ren[Ren$studyYear == 2024, ]
+
+y_train <- as.numeric(R_train$BLUE)/1000
+y_test  <- as.numeric(R_test$BLUE)/1000
+
+id_train <- trimws(as.character(R_train$germplasmName))
+id_test  <- trimws(as.character(R_test$germplasmName))
+
+# =========================================================
+# 3. Alinear genotipos
+# =========================================================
+allelo_ids <- trimws(as.character(allelo[[1]]))
+rownames(allelo) <- allelo_ids
+
+keep_train <- id_train %in% rownames(X) & id_train %in% allelo_ids
+keep_test  <- id_test  %in% rownames(X) & id_test  %in% allelo_ids
+
+id_train <- id_train[keep_train]
+id_test  <- id_test[keep_test]
+
+y_train <- y_train[keep_train]
+y_test  <- y_test[keep_test]
+
+# =========================================================
+# 4. SNPs alineados
+# =========================================================
+colnames(X) <- trimws(colnames(X))
+colnames(allelo) <- trimws(colnames(allelo))
+
+common_snps <- intersect(colnames(X), colnames(allelo)[-1])
+
+X_train <- X[id_train, common_snps, drop = FALSE]
+X_test  <- X[id_test,  common_snps, drop = FALSE]
+
+mu_X <- colMeans(X_train)
+
+Xc_train <- scale(X_train, center = mu_X, scale = FALSE)
+Xc_test  <- scale(X_test,  center = mu_X, scale = FALSE)
+
+# =========================================================
+# 5. Kernel GBLUP
+# =========================================================
+K_train      <- tcrossprod(Xc_train) / ncol(Xc_train)
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 6. Kernel molecular
+# =========================================================
+allelo_train <- allelo[match(id_train, allelo_ids), common_snps]
+allelo_test  <- allelo[match(id_test,  allelo_ids), common_snps]
+
+allelo_all <- rbind(allelo_train, allelo_test)
+
+allelo_all[allelo_all == "FAIL"] <- NA
+allelo_all <- apply(allelo_all, c(1,2), function(x) toupper(trimws(x)))
+
+base_raw <- c(A=135.13, G=151.13, C=111.10, T=126.11)
+base_map <- (base_raw - mean(base_raw)) / sd(base_raw)
+
+encode <- function(b){
+  if(is.na(b)) return(NA)
+  b <- gsub("[^ACGT]", "", b)
+  if(nchar(b)==1) return(base_map[[b]])
+  return(NA)
+}
+
+allele_num <- apply(allelo_all, c(1,2), encode)
+
+latent_dist <- as.matrix(dist(t(allele_num)))
+mean_d <- mean(latent_dist[latent_dist>0], na.rm = TRUE)
+
+latent_sim <- exp(-latent_dist / mean_d)
+latent_sim[is.na(latent_sim)] <- 0
+
+Xc_all <- rbind(Xc_train, Xc_test)
+
+K_M_all <- Xc_all %*% latent_sim %*% t(Xc_all)
+K_M_all <- K_M_all / (sum(diag(K_M_all))/nrow(K_M_all))
+
+n_train <- nrow(Xc_train)
+
+K_M_train      <- K_M_all[1:n_train, 1:n_train]
+K_M_test_train <- K_M_all[(n_train+1):nrow(K_M_all), 1:n_train]
+
+# ========================================================
+year_vector <- R_train$studyYear[keep_train]
+year_factor <- factor(year_vector)
+
+X_env <- model.matrix(~ 0 + year_factor)
+# =========================================================
+# 8. MODELO
+# =========================================================
+ETA <- list(
+  ENV = list(X = X_env, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS"),
+  M   = list(K = K_M_train, model = "RKHS")
+)
+
+# =========================================================
+# 9. AJUSTE MULTI-CADENA
+# =========================================================
+set.seed(101)
+fit1 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000,saveAt = "Kernelmu1_", burnIn = 45000, verbose = FALSE)
+
+set.seed(102)
+fit2 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000,saveAt = "Kernelmu2_", burnIn = 45000, verbose = FALSE)
+
+set.seed(103)
+fit3 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000,saveAt = "Kernelmu3_", burnIn = 45000, verbose = FALSE)
+
+# =========================================================
+# 10. PROMEDIO DE PARÁMETROS
+# =========================================================
+u_G <- (fit1$ETA[[2]]$u + fit2$ETA[[2]]$u + fit3$ETA[[2]]$u) / 3
+u_M <- (fit1$ETA[[3]]$u + fit2$ETA[[3]]$u + fit3$ETA[[3]]$u) / 3
+mu  <- (fit1$mu + fit2$mu + fit3$mu) / 3
+
+# =========================================================
+# 11. PREDICCIÓN
+# =========================================================
+u_pred_G <- K_test_train %*% ginv(K_train) %*% u_G
+u_pred_M <- K_M_test_train %*% ginv(K_M_train) %*% u_M
+
+y_pred <- as.vector(mu + u_pred_G + u_pred_M)
+
+
+
+
+
+#######################################################################################################################
+
+
+Resultados <- data.frame(
+  Line = id_test,
+  Observed = y_test,
+  Predicted = y_pred
+)
+
+
+Resultados <- Resultados[
+  order(Resultados$Predicted, decreasing = TRUE),
+]
+
+
+n <- nrow(Resultados)
+
+nTop <- ceiling(0.10*n)
+
+Top10 <- Resultados[1:nTop, ]
+
+MeanTop10 <- mean(Top10$Observed)
+
+MeanTop10
+
+
+
+MeanPopulation <- mean(Resultados$Observed)
+
+MeanPopulation
+
+
+SelectionDifferential <- MeanTop10 - MeanPopulation
+
+SelectionDifferential
+##########################################################################################
+
+SelectionStatistics <- function(y_true,y_pred,p=0.10){
+
+    datos <- data.frame(
+        Observed=y_true,
+        Predicted=y_pred
+    )
+
+    datos <- datos[
+        order(datos$Predicted,decreasing=TRUE),
+    ]
+
+    nTop <- ceiling(p*nrow(datos))
+
+    top <- datos[1:nTop,]
+
+    MeanPopulation <- mean(datos$Observed)
+
+    MeanTop <- mean(top$Observed)
+
+    SD <- MeanTop-MeanPopulation
+
+    SDpercent <- 100*SD/MeanPopulation
+
+    list(
+        MeanPopulation=MeanPopulation,
+        MeanTop=MeanTop,
+        SelectionDifferential=SD,
+        SelectionDifferentialPercent=SDpercent,
+        TopIndividuals=top
+    )
+}
+
+MSGK <- SelectionStatistics(y_test,y_pred)
+
+MSGK$TopIndividuals
+
+# =========================================================
+# 12. EVALUACIÓN
+# =========================================================
+cor_pred <- cor(y_test, y_pred)
+rmse     <- sqrt(mean((y_test - y_pred)^2))
+
+cat("Cor =", round(cor_pred,4), "\n")
+cat("RMSE =", round(rmse,4), "\n")
+
+png("MSGK-singxe_Validation_2024_HD.png", 
+    width = 1800, height = 1800, res = 300) 
+
+
+par(pty = "s", mar = c(5, 5, 4, 2)) 
+
+
+plot(y_test, y_pred, 
+     xlab = "Observed ",   
+     ylab = "Predicted ",  
+     pch = 19, 
+     col = "darkred",
+     cex.lab = 1.1,    
+     axes = FALSE) 
+
+
+axis(1, lwd = 2) # Eje X con línea gruesa
+axis(2, lwd = 2) # Eje Y con línea gruesa
+
+
+box(bty = "l", lwd = 2)
+
+# 6. Añadir la línea de referencia 1:1 (discontinua)
+abline(0, 1, col = "blue", lwd = 2, lty = 2)
+
+
+dev.off()
+
+cat("Imagen generada exitosamente en tu carpeta de trabajo.")
+```
+
+
+
+# Posterior
+```{r}
+# =========================================================
+
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("Kernelmu1_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("Kernelmu2_", pattern), quiet = TRUE)
+  c3 <- scan(paste0("Kernelmu3_", pattern), quiet = TRUE)
+ 
+  
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c3, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+m_mcmc   <- load_mcmc_named("ETA_M_varU.dat", "Molecular_Variance_M")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+
+
+# =========================================================
+# Combinamos las 4 cadenas de cada parámetro en un solo vector
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+m_com  <- as.numeric(do.call(rbind, m_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+cat("\nCadenas unificadas correctamente. Listas para el reescalado.\n")
+
+
+params_list <- list(mu_mcmc, u_mcmc, m_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean24", "Trace_VarG24", "Trace_VarM24",  "Trace_VarE24","Trace_VarEnv24")
+
+
+
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[M]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+# regresar a escala verdadera
+```{r}
+
+real_mean_mu  <- (mean(mu_com) )
+real_var_G    <- mean(u_com)  
+real_var_M    <- mean(m_com)  
+real_var_E    <- mean(e_com)  
+real_var_Env    <- mean(env_com)  
+
+
+h2_val <- (mean(u_com) + mean(m_com) ) / 
+          (mean(u_com) + mean(m_com)  + mean(e_com))
+
+cat("\n========== RESULTS IN REAL SCALE (t/ha) ==========\n")
+cat("Global Mean:      ", round(real_mean_mu, 3), "t/ha\n")
+cat("Variance G:       ", round(real_var_G, 3), "\n")
+cat("Variance M:       ", round(real_var_M, 3), "\n")
+cat("Variance E:       ", round(real_var_E, 3), "\n")
+cat("--------------------------------------------------\n")
+cat("Heritability (h2):", round(h2_val, 3), "\n")
+cat("==================================================\n")
+```
+
+
+```{r}
+library(HDInterval)
+
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+m_real_chain   <- m_com  
+e_real_chain   <- e_com  
+env_real_chain   <- env_com  
+
+h2_chain <- (u_com + m_com ) / (u_com + m_com  + e_com)
+
+summary(h2_chain)
+
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance M`        = calc_real_stats(m_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# =========================================================
+library(coda)
+
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_m   <- gelman.diag(m_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env   <- gelman.diag(env_mcmc)
+
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance M`         = gr_m$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+  `Variance Env`         = gr_env$psrf[1, ])
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+# Interpretación automática
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+# 3 cadenas 2023
+```{r}
+rm(list = ls())
+library(BGLR)
+library(MASS)
+
+setwd("C:/Users/karre/Downloads/MSGK-Articulo-R-ren-singxe")
+
+# =========================================================
+# 1. Cargar datos
+# =========================================================
+Dat <- read.csv("Conventional_Long_Traits_2018_24_Shared_updatedwithchecks_FINALCLEANED.csv",
+                header = TRUE, stringsAsFactors = FALSE)
+
+load("X.RData")
+
+allelo <- read.csv("snp_agriplex_2039_Coventional_Long (1).csv",
+                   stringsAsFactors = FALSE)
+
+# =========================================================
+# 2. Filtrar rasgo
+# =========================================================
+Ren <- Dat[Dat$Trait == "Yield.LSU_01.0000138", ]
+Ren$germplasmName <- trimws(as.character(Ren$germplasmName))
+
+R_train <- Ren[Ren$studyYear %in% c(2018,2019,2020,2021,2022,2024), ]
+R_test  <- Ren[Ren$studyYear == 2023, ]
+
+
+y_train <- as.numeric(R_train$BLUE)/1000
+y_test  <- as.numeric(R_test$BLUE)/1000
+
+id_train <- trimws(as.character(R_train$germplasmName))
+id_test  <- trimws(as.character(R_test$germplasmName))
+
+# =========================================================
+# 3. Alinear genotipos
+# =========================================================
+allelo_ids <- trimws(as.character(allelo[[1]]))
+rownames(allelo) <- allelo_ids
+
+keep_train <- id_train %in% rownames(X) & id_train %in% allelo_ids
+keep_test  <- id_test  %in% rownames(X) & id_test  %in% allelo_ids
+
+id_train <- id_train[keep_train]
+id_test  <- id_test[keep_test]
+
+y_train <- y_train[keep_train]
+y_test  <- y_test[keep_test]
+
+# =========================================================
+# 4. SNPs alineados
+# =========================================================
+colnames(X) <- trimws(colnames(X))
+colnames(allelo) <- trimws(colnames(allelo))
+
+common_snps <- intersect(colnames(X), colnames(allelo)[-1])
+
+X_train <- X[id_train, common_snps, drop = FALSE]
+X_test  <- X[id_test,  common_snps, drop = FALSE]
+
+mu_X <- colMeans(X_train)
+
+Xc_train <- scale(X_train, center = mu_X, scale = FALSE)
+Xc_test  <- scale(X_test,  center = mu_X, scale = FALSE)
+
+# =========================================================
+# 5. Kernel GBLUP
+# =========================================================
+K_train      <- tcrossprod(Xc_train) / ncol(Xc_train)
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 6. Kernel molecular
+# =========================================================
+allelo_train <- allelo[match(id_train, allelo_ids), common_snps]
+allelo_test  <- allelo[match(id_test,  allelo_ids), common_snps]
+
+allelo_all <- rbind(allelo_train, allelo_test)
+
+allelo_all[allelo_all == "FAIL"] <- NA
+allelo_all <- apply(allelo_all, c(1,2), function(x) toupper(trimws(x)))
+
+base_raw <- c(A=135.13, G=151.13, C=111.10, T=126.11)
+base_map <- (base_raw - mean(base_raw)) / sd(base_raw)
+
+encode <- function(b){
+  if(is.na(b)) return(NA)
+  b <- gsub("[^ACGT]", "", b)
+  if(nchar(b)==1) return(base_map[[b]])
+  return(NA)
+}
+
+allele_num <- apply(allelo_all, c(1,2), encode)
+
+latent_dist <- as.matrix(dist(t(allele_num)))
+mean_d <- mean(latent_dist[latent_dist>0], na.rm = TRUE)
+
+latent_sim <- exp(-latent_dist / mean_d)
+latent_sim[is.na(latent_sim)] <- 0
+
+Xc_all <- rbind(Xc_train, Xc_test)
+
+K_M_all <- Xc_all %*% latent_sim %*% t(Xc_all)
+K_M_all <- K_M_all / (sum(diag(K_M_all))/nrow(K_M_all))
+
+n_train <- nrow(Xc_train)
+
+K_M_train      <- K_M_all[1:n_train, 1:n_train]
+K_M_test_train <- K_M_all[(n_train+1):nrow(K_M_all), 1:n_train]
+
+
+
+year_vector <- R_train$studyYear[keep_train]
+year_factor <- factor(year_vector)
+X_env <- model.matrix(~ 0 + year_factor)
+
+# =========================================================
+# 8. MODELO
+# =========================================================
+ETA <- list(
+  ENV = list(X = X_env, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS"),
+  M   = list(K = K_M_train, model = "RKHS")
+)
+
+# =========================================================
+# 9. AJUSTE MULTI-CADENA
+# =========================================================
+set.seed(101)
+fit1 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu123_", verbose = FALSE)
+
+set.seed(102)
+fit2 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu223_", verbose = FALSE)
+
+set.seed(103)
+fit3 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu323_", verbose = FALSE)
+
+# =========================================================
+# 10. PROMEDIO DE PARÁMETROS
+# =========================================================
+u_G <- (fit1$ETA[[2]]$u + fit2$ETA[[2]]$u + fit3$ETA[[2]]$u) / 3
+u_M <- (fit1$ETA[[3]]$u + fit2$ETA[[3]]$u + fit3$ETA[[3]]$u) / 3
+mu  <- (fit1$mu + fit2$mu + fit3$mu) / 3
+
+# =========================================================
+# 11. PREDICCIÓN
+# =========================================================
+u_pred_G <- K_test_train %*% ginv(K_train) %*% u_G
+u_pred_M <- K_M_test_train %*% ginv(K_M_train) %*% u_M
+
+y_pred <- as.vector(mu + u_pred_G + u_pred_M)
+
+# =========================================================
+# 12. EVALUACIÓN
+# =========================================================
+cor_pred <- cor(y_test, y_pred)
+rmse     <- sqrt(mean((y_test - y_pred)^2))
+
+cat("Cor =", round(cor_pred,4), "\n")
+cat("RMSE =", round(rmse,4), "\n")
+```
+
+
+# Posterior
+```{r}
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("Kernelmu123_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("Kernelmu223_", pattern), quiet = TRUE)
+  c3 <- scan(paste0("Kernelmu323_", pattern), quiet = TRUE)
+ 
+  
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c3, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+# 1. Load Chains
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+m_mcmc   <- load_mcmc_named("ETA_M_varU.dat", "Molecular_Variance_M")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+
+# =========================================================
+# Combinamos las 4 cadenas de cada parámetro en un solo vector
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+m_com  <- as.numeric(do.call(rbind, m_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+cat("\nCadenas unificadas correctamente. Listas para el reescalado.\n")
+
+
+params_list <- list(mu_mcmc, u_mcmc, m_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean24", "Trace_VarG24", "Trace_VarM24",  "Trace_VarE24","Trace_VarEnv24")
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[M]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+# regresar a escala verdadera
+```{r}
+
+real_mean_mu  <- (mean(mu_com) )
+real_var_G    <- mean(u_com)  
+real_var_M    <- mean(m_com)  
+real_var_E    <- mean(e_com)  
+real_var_E    <- mean(env_com)  
+
+
+h2_val <- (mean(u_com) + mean(m_com) ) / 
+          (mean(u_com) + mean(m_com)  + mean(e_com))
+
+cat("\n========== RESULTS IN REAL SCALE (t/ha) ==========\n")
+cat("Global Mean:      ", round(real_mean_mu, 3), "t/ha\n")
+cat("Variance G:       ", round(real_var_G, 3), "\n")
+cat("Variance M:       ", round(real_var_M, 3), "\n")
+cat("Variance E:       ", round(real_var_E, 3), "\n")
+cat("--------------------------------------------------\n")
+cat("Heritability (h2):", round(h2_val, 3), "\n")
+cat("==================================================\n")
+```
+
+
+```{r}
+# =========================================================
+# =========================================================
+library(HDInterval)
+
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+m_real_chain   <- m_com  
+e_real_chain   <- e_com  
+env_real_chain   <- env_com  
+
+
+h2_chain <- (u_com + m_com ) / (u_com + m_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance M`        = calc_real_stats(m_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN DIAGNOSTIC (CONVERGENCE CHECK)
+# =========================================================
+library(coda)
+
+# Calcular el diagnóstico para cada parámetro
+# Un valor cercano a 1.00 (ej. < 1.1) indica buena convergencia
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_m   <- gelman.diag(m_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env   <- gelman.diag(env_mcmc)
+
+# Extraer el "Point Estimate" que es el valor principal de R-hat
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance M`         = gr_m$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+  `Variance Env`         = gr_env$psrf[1, ])
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+# Interpretación automática
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+# 3 cadenas 2022
+```{r}
+rm(list = ls())
+library(BGLR)
+library(MASS)
+
+setwd("C:/Users/karre/Downloads/MSGK-Articulo-R-ren-singxe")
+
+# =========================================================
+# 1. Cargar datos
+# =========================================================
+Dat <- read.csv("Conventional_Long_Traits_2018_24_Shared_updatedwithchecks_FINALCLEANED.csv",
+                header = TRUE, stringsAsFactors = FALSE)
+
+load("X.RData")
+
+allelo <- read.csv("snp_agriplex_2039_Coventional_Long (1).csv",
+                   stringsAsFactors = FALSE)
+
+# =========================================================
+# 2. Filtrar rasgo
+# =========================================================
+Ren <- Dat[Dat$Trait == "Yield.LSU_01.0000138", ]
+Ren$germplasmName <- trimws(as.character(Ren$germplasmName))
+
+R_train <- Ren[Ren$studyYear %in% c(2018,2019,2020,2021,2023,2024), ]
+R_test  <- Ren[Ren$studyYear == 2022, ]
+
+
+y_train <- as.numeric(R_train$BLUE)/1000
+y_test  <- as.numeric(R_test$BLUE)/1000
+
+id_train <- trimws(as.character(R_train$germplasmName))
+id_test  <- trimws(as.character(R_test$germplasmName))
+
+# =========================================================
+# 3. Alinear genotipos
+# =========================================================
+allelo_ids <- trimws(as.character(allelo[[1]]))
+rownames(allelo) <- allelo_ids
+
+keep_train <- id_train %in% rownames(X) & id_train %in% allelo_ids
+keep_test  <- id_test  %in% rownames(X) & id_test  %in% allelo_ids
+
+id_train <- id_train[keep_train]
+id_test  <- id_test[keep_test]
+
+y_train <- y_train[keep_train]
+y_test  <- y_test[keep_test]
+
+# =========================================================
+# 4. SNPs alineados
+# =========================================================
+colnames(X) <- trimws(colnames(X))
+colnames(allelo) <- trimws(colnames(allelo))
+
+common_snps <- intersect(colnames(X), colnames(allelo)[-1])
+
+X_train <- X[id_train, common_snps, drop = FALSE]
+X_test  <- X[id_test,  common_snps, drop = FALSE]
+
+mu_X <- colMeans(X_train)
+
+Xc_train <- scale(X_train, center = mu_X, scale = FALSE)
+Xc_test  <- scale(X_test,  center = mu_X, scale = FALSE)
+
+# =========================================================
+# 5. Kernel GBLUP
+# =========================================================
+K_train      <- tcrossprod(Xc_train) / ncol(Xc_train)
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 6. Kernel molecular
+# =========================================================
+allelo_train <- allelo[match(id_train, allelo_ids), common_snps]
+allelo_test  <- allelo[match(id_test,  allelo_ids), common_snps]
+
+allelo_all <- rbind(allelo_train, allelo_test)
+
+allelo_all[allelo_all == "FAIL"] <- NA
+allelo_all <- apply(allelo_all, c(1,2), function(x) toupper(trimws(x)))
+
+base_raw <- c(A=135.13, G=151.13, C=111.10, T=126.11)
+base_map <- (base_raw - mean(base_raw)) / sd(base_raw)
+
+encode <- function(b){
+  if(is.na(b)) return(NA)
+  b <- gsub("[^ACGT]", "", b)
+  if(nchar(b)==1) return(base_map[[b]])
+  return(NA)
+}
+
+allele_num <- apply(allelo_all, c(1,2), encode)
+
+latent_dist <- as.matrix(dist(t(allele_num)))
+mean_d <- mean(latent_dist[latent_dist>0], na.rm = TRUE)
+
+latent_sim <- exp(-latent_dist / mean_d)
+latent_sim[is.na(latent_sim)] <- 0
+
+Xc_all <- rbind(Xc_train, Xc_test)
+
+K_M_all <- Xc_all %*% latent_sim %*% t(Xc_all)
+K_M_all <- K_M_all / (sum(diag(K_M_all))/nrow(K_M_all))
+
+n_train <- nrow(Xc_train)
+
+K_M_train      <- K_M_all[1:n_train, 1:n_train]
+K_M_test_train <- K_M_all[(n_train+1):nrow(K_M_all), 1:n_train]
+
+# =========================================================
+
+year_vector <- R_train$studyYear[keep_train]
+year_factor <- factor(year_vector)
+X_env <- model.matrix(~ 0 + year_factor)
+
+
+# =========================================================
+# 8. MODELO
+# =========================================================
+ETA <- list(
+  ENV = list(X = X_env, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS"),
+  M   = list(K = K_M_train, model = "RKHS")
+)
+
+# =========================================================
+# 9. AJUSTE MULTI-CADENA
+# =========================================================
+set.seed(101)
+fit1 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu122_", verbose = FALSE)
+
+set.seed(102)
+fit2 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu222_", verbose = FALSE)
+
+set.seed(103)
+fit3 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu322_", verbose = FALSE)
+
+# =========================================================
+# 10. PROMEDIO DE PARÁMETROS
+# =========================================================
+u_G <- (fit1$ETA[[2]]$u + fit2$ETA[[2]]$u + fit3$ETA[[2]]$u) / 3
+u_M <- (fit1$ETA[[3]]$u + fit2$ETA[[3]]$u + fit3$ETA[[3]]$u) / 3
+mu  <- (fit1$mu + fit2$mu + fit3$mu) / 3
+
+# =========================================================
+# 11. PREDICCIÓN
+# =========================================================
+u_pred_G <- K_test_train %*% ginv(K_train) %*% u_G
+u_pred_M <- K_M_test_train %*% ginv(K_M_train) %*% u_M
+
+y_pred <- as.vector(mu + u_pred_G + u_pred_M)
+
+# =========================================================
+# 12. EVALUACIÓN
+# =========================================================
+cor_pred <- cor(y_test, y_pred)
+rmse     <- sqrt(mean((y_test - y_pred)^2))
+
+cat("Cor =", round(cor_pred,4), "\n")
+cat("RMSE =", round(rmse,4), "\n")
+```
+
+# Posterior
+```{r}
+# =========================================================
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("Kernelmu122_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("Kernelmu222_", pattern), quiet = TRUE)
+  c3 <- scan(paste0("Kernelmu322_", pattern), quiet = TRUE)
+ 
+  
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c3, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+m_mcmc   <- load_mcmc_named("ETA_M_varU.dat", "Molecular_Variance_M")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+
+
+
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+m_com  <- as.numeric(do.call(rbind, m_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+cat("\nCadenas unificadas correctamente. Listas para el reescalado.\n")
+
+
+params_list <- list(mu_mcmc, u_mcmc, m_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean24", "Trace_VarG24", "Trace_VarM24",  "Trace_VarE24","Trace_VarEnv24")
+
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[M]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+# regresar a escala verdadera
+```{r}
+
+real_mean_mu  <- (mean(mu_com) )
+real_var_G    <- mean(u_com)  
+real_var_M    <- mean(m_com)  
+real_var_E    <- mean(e_com)  
+real_var_E    <- mean(env_com)  
+
+
+h2_val <- (mean(u_com) + mean(m_com) ) / 
+          (mean(u_com) + mean(m_com)  + mean(e_com))
+
+cat("\n========== RESULTS IN REAL SCALE (t/ha) ==========\n")
+cat("Global Mean:      ", round(real_mean_mu, 3), "t/ha\n")
+cat("Variance G:       ", round(real_var_G, 3), "\n")
+cat("Variance M:       ", round(real_var_M, 3), "\n")
+cat("Variance E:       ", round(real_var_E, 3), "\n")
+cat("--------------------------------------------------\n")
+cat("Heritability (h2):", round(h2_val, 3), "\n")
+cat("==================================================\n")
+```
+
+
+```{r}
+# =========================================================
+# =========================================================
+library(HDInterval)
+
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+m_real_chain   <- m_com  
+e_real_chain   <- e_com  
+env_real_chain   <- env_com  
+
+
+h2_chain <- (u_com + m_com ) / (u_com + m_com  + e_com)
+
+
+
+
+summary(h2_chain)
+
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance M`        = calc_real_stats(m_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+# Gelma-Rubin
+```{r}
+
+library(coda)
+
+
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_m   <- gelman.diag(m_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env   <- gelman.diag(env_mcmc)
+
+
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance M`         = gr_m$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+  `Variance Env`         = gr_env$psrf[1, ])
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+# Interpretación automática
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+
+
+# 3 cadenas 2021
+```{r}
+rm(list = ls())
+library(BGLR)
+library(MASS)
+
+setwd("C:/Users/karre/Downloads/MSGK-Articulo-R-ren-singxe")
+
+# =========================================================
+# 1. Cargar datos
+# =========================================================
+Dat <- read.csv("Conventional_Long_Traits_2018_24_Shared_updatedwithchecks_FINALCLEANED.csv",
+                header = TRUE, stringsAsFactors = FALSE)
+
+load("X.RData")
+
+allelo <- read.csv("snp_agriplex_2039_Coventional_Long (1).csv",
+                   stringsAsFactors = FALSE)
+
+# =========================================================
+# 2. Filtrar rasgo
+# =========================================================
+Ren <- Dat[Dat$Trait == "Yield.LSU_01.0000138", ]
+Ren$germplasmName <- trimws(as.character(Ren$germplasmName))
+
+R_train <- Ren[Ren$studyYear %in% c(2018,2019,2020,2022,2023,2024), ]
+R_test  <- Ren[Ren$studyYear == 2021, ]
+
+
+y_train <- as.numeric(R_train$BLUE)/1000
+y_test  <- as.numeric(R_test$BLUE)/1000
+
+id_train <- trimws(as.character(R_train$germplasmName))
+id_test  <- trimws(as.character(R_test$germplasmName))
+
+# =========================================================
+# 3. Alinear genotipos
+# =========================================================
+allelo_ids <- trimws(as.character(allelo[[1]]))
+rownames(allelo) <- allelo_ids
+
+keep_train <- id_train %in% rownames(X) & id_train %in% allelo_ids
+keep_test  <- id_test  %in% rownames(X) & id_test  %in% allelo_ids
+
+id_train <- id_train[keep_train]
+id_test  <- id_test[keep_test]
+
+y_train <- y_train[keep_train]
+y_test  <- y_test[keep_test]
+
+# =========================================================
+# 4. SNPs alineados
+# =========================================================
+colnames(X) <- trimws(colnames(X))
+colnames(allelo) <- trimws(colnames(allelo))
+
+common_snps <- intersect(colnames(X), colnames(allelo)[-1])
+
+X_train <- X[id_train, common_snps, drop = FALSE]
+X_test  <- X[id_test,  common_snps, drop = FALSE]
+
+mu_X <- colMeans(X_train)
+
+Xc_train <- scale(X_train, center = mu_X, scale = FALSE)
+Xc_test  <- scale(X_test,  center = mu_X, scale = FALSE)
+
+# =========================================================
+# 5. Kernel GBLUP
+# =========================================================
+K_train      <- tcrossprod(Xc_train) / ncol(Xc_train)
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 6. Kernel molecular
+# =========================================================
+allelo_train <- allelo[match(id_train, allelo_ids), common_snps]
+allelo_test  <- allelo[match(id_test,  allelo_ids), common_snps]
+
+allelo_all <- rbind(allelo_train, allelo_test)
+
+allelo_all[allelo_all == "FAIL"] <- NA
+allelo_all <- apply(allelo_all, c(1,2), function(x) toupper(trimws(x)))
+
+base_raw <- c(A=135.13, G=151.13, C=111.10, T=126.11)
+base_map <- (base_raw - mean(base_raw)) / sd(base_raw)
+
+encode <- function(b){
+  if(is.na(b)) return(NA)
+  b <- gsub("[^ACGT]", "", b)
+  if(nchar(b)==1) return(base_map[[b]])
+  return(NA)
+}
+
+allele_num <- apply(allelo_all, c(1,2), encode)
+
+latent_dist <- as.matrix(dist(t(allele_num)))
+mean_d <- mean(latent_dist[latent_dist>0], na.rm = TRUE)
+
+latent_sim <- exp(-latent_dist / mean_d)
+latent_sim[is.na(latent_sim)] <- 0
+
+Xc_all <- rbind(Xc_train, Xc_test)
+
+K_M_all <- Xc_all %*% latent_sim %*% t(Xc_all)
+K_M_all <- K_M_all / (sum(diag(K_M_all))/nrow(K_M_all))
+
+n_train <- nrow(Xc_train)
+
+K_M_train      <- K_M_all[1:n_train, 1:n_train]
+K_M_test_train <- K_M_all[(n_train+1):nrow(K_M_all), 1:n_train]
+
+# =========================================================
+# 7. EFECTO FIJO
+# =========================================================
+year_vector <- R_train$studyYear[keep_train]
+year_factor <- factor(year_vector)
+X_env <- model.matrix(~ 0 + year_factor)
+
+# =========================================================
+# 8. MODELO
+# =========================================================
+ETA <- list(
+  ENV = list(X = X_env, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS"),
+  M   = list(K = K_M_train, model = "RKHS")
+)
+
+# =========================================================
+# =========================================================
+set.seed(101)
+fit1 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu121_", verbose = FALSE)
+
+set.seed(102)
+fit2 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu221_", verbose = FALSE)
+
+set.seed(103)
+fit3 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu321_", verbose = FALSE)
+
+# =========================================================
+# 10. PROMEDIO DE PARÁMETROS
+# =========================================================
+u_G <- (fit1$ETA[[2]]$u + fit2$ETA[[2]]$u + fit3$ETA[[2]]$u) / 3
+u_M <- (fit1$ETA[[3]]$u + fit2$ETA[[3]]$u + fit3$ETA[[3]]$u) / 3
+mu  <- (fit1$mu + fit2$mu + fit3$mu) / 3
+
+# =========================================================
+# 11. PREDICCIÓN
+# =========================================================
+u_pred_G <- K_test_train %*% ginv(K_train) %*% u_G
+u_pred_M <- K_M_test_train %*% ginv(K_M_train) %*% u_M
+
+y_pred <- as.vector(mu + u_pred_G + u_pred_M)
+
+# =========================================================
+# 12. EVALUACIÓN
+# =========================================================
+cor_pred <- cor(y_test, y_pred)
+rmse     <- sqrt(mean((y_test - y_pred)^2))
+
+cat("Cor =", round(cor_pred,4), "\n")
+cat("RMSE =", round(rmse,4), "\n")
+```
+
+# Posterior
+```{r}
+# =========================================================
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+# Professional palette for 4 MCMC chains
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("Kernelmu121_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("Kernelmu221_", pattern), quiet = TRUE)
+  c3 <- scan(paste0("Kernelmu321_", pattern), quiet = TRUE)
+ 
+  
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c3, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+# 1. Load Chains
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+m_mcmc   <- load_mcmc_named("ETA_M_varU.dat", "Molecular_Variance_M")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+
+
+# =========================================================
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+m_com  <- as.numeric(do.call(rbind, m_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+cat("\nCadenas unificadas correctamente. Listas para el reescalado.\n")
+
+# 2. List for processing
+params_list <- list(mu_mcmc, u_mcmc, m_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean24", "Trace_VarG24", "Trace_VarM24",  "Trace_VarE24","Trace_VarEnv24")
+
+
+
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[M]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# ====================================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) + 
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+# regresar a escala verdadera
+```{r}
+#
+real_mean_mu  <- (mean(mu_com) )
+real_var_G    <- mean(u_com)  
+real_var_M    <- mean(m_com)  
+real_var_E    <- mean(e_com)  
+real_var_E    <- mean(env_com)  
+
+
+# Heritability (Broad-sense h2)
+# Formula: (G + M + GY) / (G + M + GY + E)
+h2_val <- (mean(u_com) + mean(m_com) ) / 
+          (mean(u_com) + mean(m_com)  + mean(e_com))
+
+cat("\n========== RESULTS IN REAL SCALE (t/ha) ==========\n")
+cat("Global Mean:      ", round(real_mean_mu, 3), "t/ha\n")
+cat("Variance G:       ", round(real_var_G, 3), "\n")
+cat("Variance M:       ", round(real_var_M, 3), "\n")
+cat("Variance E:       ", round(real_var_E, 3), "\n")
+cat("--------------------------------------------------\n")
+cat("Heritability (h2):", round(h2_val, 3), "\n")
+cat("==================================================\n")
+```
+
+
+```{r}
+# =========================================================
+# 5. HDI ANALYSIS (CORRECTED FOR FULL CHAINS)
+# =========================================================
+library(HDInterval)
+
+# 1. Transformar las cadenas COMPLETAS (vectores, no promedios)
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+m_real_chain   <- m_com  
+e_real_chain   <- e_com  
+env_real_chain   <- env_com  
+
+# 2. Calcular la Heredabilidad como una CADENA COMPLETA
+# Esto es vital para que el HDI de h2 no sea un solo número repetido
+h2_chain <- (u_com + m_com ) / (u_com + m_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance M`        = calc_real_stats(m_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN DIAGNOSTIC (CONVERGENCE CHECK)
+# =========================================================
+library(coda)
+
+# Calcular el diagnóstico para cada parámetro
+# Un valor cercano a 1.00 (ej. < 1.1) indica buena convergencia
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_m   <- gelman.diag(m_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env   <- gelman.diag(env_mcmc)
+
+# Extraer el "Point Estimate" que es el valor principal de R-hat
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance M`         = gr_m$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+  `Variance Env`         = gr_env$psrf[1, ])
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+# Interpretación automática
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+
+
+
+# 3 cadenas 2020
+```{r}
+rm(list = ls())
+library(BGLR)
+library(MASS)
+
+setwd("C:/Users/karre/Downloads/MSGK-Articulo-R-ren-singxe")
+
+# =========================================================
+# 1. Cargar datos
+# =========================================================
+Dat <- read.csv("Conventional_Long_Traits_2018_24_Shared_updatedwithchecks_FINALCLEANED.csv",
+                header = TRUE, stringsAsFactors = FALSE)
+
+load("X.RData")
+
+allelo <- read.csv("snp_agriplex_2039_Coventional_Long (1).csv",
+                   stringsAsFactors = FALSE)
+
+# =========================================================
+# 2. Filtrar rasgo
+# =========================================================
+Ren <- Dat[Dat$Trait == "Yield.LSU_01.0000138", ]
+Ren$germplasmName <- trimws(as.character(Ren$germplasmName))
+
+R_train <- Ren[Ren$studyYear %in% c(2018,2019,2021,2022,2023,2024), ]
+R_test  <- Ren[Ren$studyYear == 2020, ]
+
+
+y_train <- as.numeric(R_train$BLUE)/1000
+y_test  <- as.numeric(R_test$BLUE)/1000
+
+id_train <- trimws(as.character(R_train$germplasmName))
+id_test  <- trimws(as.character(R_test$germplasmName))
+
+# =========================================================
+# 3. Alinear genotipos
+# =========================================================
+allelo_ids <- trimws(as.character(allelo[[1]]))
+rownames(allelo) <- allelo_ids
+
+keep_train <- id_train %in% rownames(X) & id_train %in% allelo_ids
+keep_test  <- id_test  %in% rownames(X) & id_test  %in% allelo_ids
+
+id_train <- id_train[keep_train]
+id_test  <- id_test[keep_test]
+
+y_train <- y_train[keep_train]
+y_test  <- y_test[keep_test]
+
+# =========================================================
+# 4. SNPs alineados
+# =========================================================
+colnames(X) <- trimws(colnames(X))
+colnames(allelo) <- trimws(colnames(allelo))
+
+common_snps <- intersect(colnames(X), colnames(allelo)[-1])
+
+X_train <- X[id_train, common_snps, drop = FALSE]
+X_test  <- X[id_test,  common_snps, drop = FALSE]
+
+mu_X <- colMeans(X_train)
+
+Xc_train <- scale(X_train, center = mu_X, scale = FALSE)
+Xc_test  <- scale(X_test,  center = mu_X, scale = FALSE)
+
+# =========================================================
+# 5. Kernel GBLUP
+# =========================================================
+K_train      <- tcrossprod(Xc_train) / ncol(Xc_train)
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 6. Kernel molecular
+# =========================================================
+allelo_train <- allelo[match(id_train, allelo_ids), common_snps]
+allelo_test  <- allelo[match(id_test,  allelo_ids), common_snps]
+
+allelo_all <- rbind(allelo_train, allelo_test)
+
+allelo_all[allelo_all == "FAIL"] <- NA
+allelo_all <- apply(allelo_all, c(1,2), function(x) toupper(trimws(x)))
+
+base_raw <- c(A=135.13, G=151.13, C=111.10, T=126.11)
+base_map <- (base_raw - mean(base_raw)) / sd(base_raw)
+
+encode <- function(b){
+  if(is.na(b)) return(NA)
+  b <- gsub("[^ACGT]", "", b)
+  if(nchar(b)==1) return(base_map[[b]])
+  return(NA)
+}
+
+allele_num <- apply(allelo_all, c(1,2), encode)
+
+latent_dist <- as.matrix(dist(t(allele_num)))
+mean_d <- mean(latent_dist[latent_dist>0], na.rm = TRUE)
+
+latent_sim <- exp(-latent_dist / mean_d)
+latent_sim[is.na(latent_sim)] <- 0
+
+Xc_all <- rbind(Xc_train, Xc_test)
+
+K_M_all <- Xc_all %*% latent_sim %*% t(Xc_all)
+K_M_all <- K_M_all / (sum(diag(K_M_all))/nrow(K_M_all))
+
+n_train <- nrow(Xc_train)
+
+K_M_train      <- K_M_all[1:n_train, 1:n_train]
+K_M_test_train <- K_M_all[(n_train+1):nrow(K_M_all), 1:n_train]
+
+# =========================================================
+# 7. EFECTO FIJO
+# =========================================================
+year_vector <- R_train$studyYear[keep_train]
+year_factor <- factor(year_vector)
+X_env <- model.matrix(~ 0 + year_factor)
+
+
+# =========================================================
+# 8. MODELO
+# =========================================================
+ETA <- list(
+  ENV = list(X =X_env, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS"),
+  M   = list(K = K_M_train, model = "RKHS")
+)
+
+# =========================================================
+# 9. AJUSTE MULTI-CADENA
+# =========================================================
+set.seed(101)
+fit1 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu120_", verbose = FALSE)
+
+set.seed(102)
+fit2 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu220_", verbose = FALSE)
+
+set.seed(103)
+fit3 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 60000, burnIn = 40000, saveAt  = "Kernelmu320_", verbose = FALSE)
+
+# =========================================================
+# 10. PROMEDIO DE PARÁMETROS
+# =========================================================
+u_G <- (fit1$ETA[[2]]$u + fit2$ETA[[2]]$u + fit3$ETA[[2]]$u) / 3
+u_M <- (fit1$ETA[[3]]$u + fit2$ETA[[3]]$u + fit3$ETA[[3]]$u) / 3
+mu  <- (fit1$mu + fit2$mu + fit3$mu) / 3
+
+# =========================================================
+# 11. PREDICCIÓN
+# =========================================================
+u_pred_G <- K_test_train %*% ginv(K_train) %*% u_G
+u_pred_M <- K_M_test_train %*% ginv(K_M_train) %*% u_M
+
+y_pred <- as.vector(mu + u_pred_G + u_pred_M)
+
+# =========================================================
+# 12. EVALUACIÓN
+# =========================================================
+cor_pred <- cor(y_test, y_pred)
+rmse     <- sqrt(mean((y_test - y_pred)^2))
+
+cat("Cor =", round(cor_pred,4), "\n")
+cat("RMSE =", round(rmse,4), "\n")
+```
+
+# Posterior
+```{r}
+# =========================================================
+# NEW POSTERIOR ANALYSIS SECTION (HD & ENGLISH)
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+# Professional palette for 4 MCMC chains
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+# Function to load MCMC and assign names (Prevents "No parameter names found" error)
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("Kernelmu120_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("Kernelmu220_", pattern), quiet = TRUE)
+  c3 <- scan(paste0("Kernelmu320_", pattern), quiet = TRUE)
+ 
+  
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c3, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+# 1. Load Chains
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+m_mcmc   <- load_mcmc_named("ETA_M_varU.dat", "Molecular_Variance_M")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+
+
+# =========================================================
+# UNIFICACIÓN DE CADENAS (COMBINAR LAS 4 CADENAS)
+# =========================================================
+# Combinamos las 4 cadenas de cada parámetro en un solo vector
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+m_com  <- as.numeric(do.call(rbind, m_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+cat("\nCadenas unificadas correctamente. Listas para el reescalado.\n")
+
+# 2. List for processing
+params_list <- list(mu_mcmc, u_mcmc, m_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean24", "Trace_VarG24", "Trace_VarM24",  "Trace_VarE24","Trace_VarEnv24")
+
+
+
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[M]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# =========================================================
+# 3. BUCLE PARA GUARDAR TRAZAS HD
+# =========================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  # Doble corchete para la expresión
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+# regresar a escala verdadera
+```{r}
+real_mean_mu  <- (mean(mu_com) )
+real_var_G    <- mean(u_com)  
+real_var_M    <- mean(m_com)  
+real_var_E    <- mean(e_com)  
+real_var_E    <- mean(env_com)  
+
+# Heritability (Broad-sense h2)
+# Formula: (G + M + GY) / (G + M + GY + E)
+h2_val <- (mean(u_com) + mean(m_com) ) / 
+          (mean(u_com) + mean(m_com)  + mean(e_com))
+
+cat("\n========== RESULTS IN REAL SCALE (t/ha) ==========\n")
+cat("Global Mean:      ", round(real_mean_mu, 3), "t/ha\n")
+cat("Variance G:       ", round(real_var_G, 3), "\n")
+cat("Variance M:       ", round(real_var_M, 3), "\n")
+cat("Variance E:       ", round(real_var_E, 3), "\n")
+cat("--------------------------------------------------\n")
+cat("Heritability (h2):", round(h2_val, 3), "\n")
+cat("==================================================\n")
+```
+
+
+```{r}
+# =========================================================
+# 5. HDI ANALYSIS (CORRECTED FOR FULL CHAINS)
+# =========================================================
+library(HDInterval)
+
+# 1. Transformar las cadenas COMPLETAS (vectores, no promedios)
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+m_real_chain   <- m_com  
+e_real_chain   <- e_com  
+env_real_chain   <- env_com  
+
+# 2. Calcular la Heredabilidad como una CADENA COMPLETA
+# Esto es vital para que el HDI de h2 no sea un solo número repetido
+h2_chain <- (u_com + m_com ) / (u_com + m_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance M`        = calc_real_stats(m_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN DIAGNOSTIC (CONVERGENCE CHECK)
+# =========================================================
+library(coda)
+
+# Calcular el diagnóstico para cada parámetro
+# Un valor cercano a 1.00 (ej. < 1.1) indica buena convergencia
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_m   <- gelman.diag(m_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env   <- gelman.diag(env_mcmc)
+
+# Extraer el "Point Estimate" que es el valor principal de R-hat
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance M`         = gr_m$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+  `Variance Env`         = gr_env$psrf[1, ])
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+# Interpretación automática
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+
+# 3 cadenas 2019
+```{r}
+rm(list = ls())
+library(BGLR)
+library(MASS)
+
+setwd("C:/Users/karre/Downloads/MSGK-Articulo-R-ren-singxe")
+
+# =========================================================
+# 1. Cargar datos
+# =========================================================
+Dat <- read.csv("Conventional_Long_Traits_2018_24_Shared_updatedwithchecks_FINALCLEANED.csv",
+                header = TRUE, stringsAsFactors = FALSE)
+
+load("X.RData")
+
+allelo <- read.csv("snp_agriplex_2039_Coventional_Long (1).csv",
+                   stringsAsFactors = FALSE)
+
+# =========================================================
+# 2. Filtrar rasgo
+# =========================================================
+Ren <- Dat[Dat$Trait == "Yield.LSU_01.0000138", ]
+Ren$germplasmName <- trimws(as.character(Ren$germplasmName))
+
+R_train <- Ren[Ren$studyYear %in% c(2018,2020,2021,2022,2023,2024), ]
+R_test  <- Ren[Ren$studyYear == 2019, ]
+
+
+y_train <- as.numeric(R_train$BLUE)/1000
+y_test  <- as.numeric(R_test$BLUE)/1000
+
+id_train <- trimws(as.character(R_train$germplasmName))
+id_test  <- trimws(as.character(R_test$germplasmName))
+
+# =========================================================
+# 3. Alinear genotipos
+# =========================================================
+allelo_ids <- trimws(as.character(allelo[[1]]))
+rownames(allelo) <- allelo_ids
+
+keep_train <- id_train %in% rownames(X) & id_train %in% allelo_ids
+keep_test  <- id_test  %in% rownames(X) & id_test  %in% allelo_ids
+
+id_train <- id_train[keep_train]
+id_test  <- id_test[keep_test]
+
+y_train <- y_train[keep_train]
+y_test  <- y_test[keep_test]
+
+# =========================================================
+# 4. SNPs alineados
+# =========================================================
+colnames(X) <- trimws(colnames(X))
+colnames(allelo) <- trimws(colnames(allelo))
+
+common_snps <- intersect(colnames(X), colnames(allelo)[-1])
+
+X_train <- X[id_train, common_snps, drop = FALSE]
+X_test  <- X[id_test,  common_snps, drop = FALSE]
+
+mu_X <- colMeans(X_train)
+
+Xc_train <- scale(X_train, center = mu_X, scale = FALSE)
+Xc_test  <- scale(X_test,  center = mu_X, scale = FALSE)
+
+# =========================================================
+# 5. Kernel GBLUP
+# =========================================================
+K_train      <- tcrossprod(Xc_train) / ncol(Xc_train)
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 6. Kernel molecular
+# =========================================================
+allelo_train <- allelo[match(id_train, allelo_ids), common_snps]
+allelo_test  <- allelo[match(id_test,  allelo_ids), common_snps]
+
+allelo_all <- rbind(allelo_train, allelo_test)
+
+allelo_all[allelo_all == "FAIL"] <- NA
+allelo_all <- apply(allelo_all, c(1,2), function(x) toupper(trimws(x)))
+
+base_raw <- c(A=135.13, G=151.13, C=111.10, T=126.11)
+base_map <- (base_raw - mean(base_raw)) / sd(base_raw)
+
+encode <- function(b){
+  if(is.na(b)) return(NA)
+  b <- gsub("[^ACGT]", "", b)
+  if(nchar(b)==1) return(base_map[[b]])
+  return(NA)
+}
+
+allele_num <- apply(allelo_all, c(1,2), encode)
+
+latent_dist <- as.matrix(dist(t(allele_num)))
+mean_d <- mean(latent_dist[latent_dist>0], na.rm = TRUE)
+
+latent_sim <- exp(-latent_dist / mean_d)
+latent_sim[is.na(latent_sim)] <- 0
+
+Xc_all <- rbind(Xc_train, Xc_test)
+
+K_M_all <- Xc_all %*% latent_sim %*% t(Xc_all)
+K_M_all <- K_M_all / (sum(diag(K_M_all))/nrow(K_M_all))
+
+n_train <- nrow(Xc_train)
+
+K_M_train      <- K_M_all[1:n_train, 1:n_train]
+K_M_test_train <- K_M_all[(n_train+1):nrow(K_M_all), 1:n_train]
+
+# =========================================================
+# 7. EFECTO FIJO
+# =========================================================
+year_vector <- R_train$studyYear[keep_train]
+year_factor <- factor(year_vector)
+X_env <- model.matrix(~ 0 + year_factor)
+
+
+# =========================================================
+# 8. MODELO
+# =========================================================
+ETA <- list(
+  ENV = list(X = X_env, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS"),
+  M   = list(K = K_M_train, model = "RKHS")
+)
+
+# =========================================================
+# 9. AJUSTE MULTI-CADENA
+# =========================================================
+set.seed(101)
+fit1 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 65000, burnIn = 45000, saveAt  = "Kernelmu119_", verbose = FALSE)
+
+set.seed(102)
+fit2 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 65000, burnIn = 45000, saveAt  = "Kernelmu219_", verbose = FALSE)
+
+set.seed(103)
+fit3 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 65000, burnIn = 45000, saveAt  = "Kernelmu319_", verbose = FALSE)
+
+# =========================================================
+# 10. PROMEDIO DE PARÁMETROS
+# =========================================================
+u_G <- (fit1$ETA[[2]]$u + fit2$ETA[[2]]$u + fit3$ETA[[2]]$u) / 3
+u_M <- (fit1$ETA[[3]]$u + fit2$ETA[[3]]$u + fit3$ETA[[3]]$u) / 3
+mu  <- (fit1$mu + fit2$mu + fit3$mu) / 3
+
+# =========================================================
+# 11. PREDICCIÓN
+# =========================================================
+u_pred_G <- K_test_train %*% ginv(K_train) %*% u_G
+u_pred_M <- K_M_test_train %*% ginv(K_M_train) %*% u_M
+
+y_pred <- as.vector(mu + u_pred_G + u_pred_M)
+
+# =========================================================
+# 12. EVALUACIÓN
+# =========================================================
+cor_pred <- cor(y_test, y_pred)
+rmse     <- sqrt(mean((y_test - y_pred)^2))
+
+cat("Cor =", round(cor_pred,4), "\n")
+cat("RMSE =", round(rmse,4), "\n")
+```
+
+
+# Posterior
+```{r}
+# =========================================================
+# NEW POSTERIOR ANALYSIS SECTION (HD & ENGLISH)
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+# Professional palette for 4 MCMC chains
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+# Function to load MCMC and assign names (Prevents "No parameter names found" error)
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("Kernelmu119_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("Kernelmu219_", pattern), quiet = TRUE)
+  c3 <- scan(paste0("Kernelmu319_", pattern), quiet = TRUE)
+ 
+  
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c3, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+# 1. Load Chains
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+m_mcmc   <- load_mcmc_named("ETA_M_varU.dat", "Molecular_Variance_M")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+
+
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+m_com  <- as.numeric(do.call(rbind, m_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+cat("\nCadenas unificadas correctamente. Listas para el reescalado.\n")
+
+# 2. List for processing
+params_list <- list(mu_mcmc, u_mcmc, m_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean24", "Trace_VarG24", "Trace_VarM24",  "Trace_VarE24","Trace_VarEnv24")
+
+
+
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[M]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# =========================================================
+# 3. BUCLE PARA GUARDAR TRAZAS HD
+# =========================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  # Doble corchete para la expresión
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+# regresar a escala verdadera
+```{r}
+
+real_mean_mu  <- (mean(mu_com) )
+real_var_G    <- mean(u_com)  
+real_var_M    <- mean(m_com)  
+real_var_E    <- mean(e_com)  
+real_var_E    <- mean(env_com)  
+
+
+# Heritability (Broad-sense h2)
+# Formula: (G + M + GY) / (G + M + GY + E)
+h2_val <- (mean(u_com) + mean(m_com) ) / 
+          (mean(u_com) + mean(m_com)  + mean(e_com))
+
+cat("\n========== RESULTS IN REAL SCALE (t/ha) ==========\n")
+cat("Global Mean:      ", round(real_mean_mu, 3), "t/ha\n")
+cat("Variance G:       ", round(real_var_G, 3), "\n")
+cat("Variance M:       ", round(real_var_M, 3), "\n")
+cat("Variance E:       ", round(real_var_E, 3), "\n")
+cat("--------------------------------------------------\n")
+cat("Heritability (h2):", round(h2_val, 3), "\n")
+cat("==================================================\n")
+```
+
+
+```{r}
+
+# =========================================================
+library(HDInterval)
+
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+m_real_chain   <- m_com  
+e_real_chain   <- e_com  
+env_real_chain   <- env_com  
+
+
+h2_chain <- (u_com + m_com ) / (u_com + m_com  + e_com)
+summary(h2_chain)
+
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance M`        = calc_real_stats(m_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# 6. GELMAN-RUBIN DIAGNOSTIC (CONVERGENCE CHECK)
+# =========================================================
+library(coda)
+
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_m   <- gelman.diag(m_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env   <- gelman.diag(env_mcmc)
+
+
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance M`         = gr_m$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+  `Variance Env`         = gr_env$psrf[1, ])
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+# Interpretación automática
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
+
+
+
+
+# 3 cadenas 2018
+```{r}
+rm(list = ls())
+library(BGLR)
+library(MASS)
+
+setwd("C:/Users/karre/Downloads/MSGK-Articulo-R-ren-singxe")
+
+# =========================================================
+# 1. Cargar datos
+# =========================================================
+Dat <- read.csv("Conventional_Long_Traits_2018_24_Shared_updatedwithchecks_FINALCLEANED.csv",
+                header = TRUE, stringsAsFactors = FALSE)
+
+load("X.RData")
+
+allelo <- read.csv("snp_agriplex_2039_Coventional_Long (1).csv",
+                   stringsAsFactors = FALSE)
+
+# =========================================================
+# 2. Filtrar rasgo
+# =========================================================
+Ren <- Dat[Dat$Trait == "Yield.LSU_01.0000138", ]
+Ren$germplasmName <- trimws(as.character(Ren$germplasmName))
+
+R_train <- Ren[Ren$studyYear %in% c(2019,2020,2021,2022,2023,2024), ]
+R_test  <- Ren[Ren$studyYear == 2018, ]
+
+
+y_train <- as.numeric(R_train$BLUE)/1000
+y_test  <- as.numeric(R_test$BLUE)/1000
+
+id_train <- trimws(as.character(R_train$germplasmName))
+id_test  <- trimws(as.character(R_test$germplasmName))
+
+# =========================================================
+# 3. Alinear genotipos
+# =========================================================
+allelo_ids <- trimws(as.character(allelo[[1]]))
+rownames(allelo) <- allelo_ids
+
+keep_train <- id_train %in% rownames(X) & id_train %in% allelo_ids
+keep_test  <- id_test  %in% rownames(X) & id_test  %in% allelo_ids
+
+id_train <- id_train[keep_train]
+id_test  <- id_test[keep_test]
+
+y_train <- y_train[keep_train]
+y_test  <- y_test[keep_test]
+
+# =========================================================
+# 4. SNPs alineados
+# =========================================================
+colnames(X) <- trimws(colnames(X))
+colnames(allelo) <- trimws(colnames(allelo))
+
+common_snps <- intersect(colnames(X), colnames(allelo)[-1])
+
+X_train <- X[id_train, common_snps, drop = FALSE]
+X_test  <- X[id_test,  common_snps, drop = FALSE]
+
+mu_X <- colMeans(X_train)
+
+Xc_train <- scale(X_train, center = mu_X, scale = FALSE)
+Xc_test  <- scale(X_test,  center = mu_X, scale = FALSE)
+
+# =========================================================
+# 5. Kernel GBLUP
+# =========================================================
+K_train      <- tcrossprod(Xc_train) / ncol(Xc_train)
+K_test_train <- (Xc_test %*% t(Xc_train)) / ncol(Xc_train)
+
+# =========================================================
+# 6. Kernel molecular
+# =========================================================
+allelo_train <- allelo[match(id_train, allelo_ids), common_snps]
+allelo_test  <- allelo[match(id_test,  allelo_ids), common_snps]
+
+allelo_all <- rbind(allelo_train, allelo_test)
+
+allelo_all[allelo_all == "FAIL"] <- NA
+allelo_all <- apply(allelo_all, c(1,2), function(x) toupper(trimws(x)))
+
+base_raw <- c(A=135.13, G=151.13, C=111.10, T=126.11)
+base_map <- (base_raw - mean(base_raw)) / sd(base_raw)
+
+encode <- function(b){
+  if(is.na(b)) return(NA)
+  b <- gsub("[^ACGT]", "", b)
+  if(nchar(b)==1) return(base_map[[b]])
+  return(NA)
+}
+
+allele_num <- apply(allelo_all, c(1,2), encode)
+
+latent_dist <- as.matrix(dist(t(allele_num)))
+mean_d <- mean(latent_dist[latent_dist>0], na.rm = TRUE)
+
+latent_sim <- exp(-latent_dist / mean_d)
+latent_sim[is.na(latent_sim)] <- 0
+
+Xc_all <- rbind(Xc_train, Xc_test)
+
+K_M_all <- Xc_all %*% latent_sim %*% t(Xc_all)
+K_M_all <- K_M_all / (sum(diag(K_M_all))/nrow(K_M_all))
+
+n_train <- nrow(Xc_train)
+
+K_M_train      <- K_M_all[1:n_train, 1:n_train]
+K_M_test_train <- K_M_all[(n_train+1):nrow(K_M_all), 1:n_train]
+
+# =========================================================
+# 7. EFECTO FIJO
+# =========================================================
+year_vector <- R_train$studyYear[keep_train]
+year_factor <- factor(year_vector)
+X_env <- model.matrix(~ 0 + year_factor)
+
+
+# =========================================================
+# 8. MODELO
+# =========================================================
+ETA <- list(
+  ENV = list(X = X_env, model = "BRR"),
+  G   = list(K = K_train, model = "RKHS"),
+  M   = list(K = K_M_train, model = "RKHS")
+)
+
+# =========================================================
+# 9. AJUSTE MULTI-CADENA
+# =========================================================
+set.seed(101)
+fit1 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 65000, burnIn = 45000, saveAt  = "Kernelmu118_", verbose = FALSE)
+
+set.seed(102)
+fit2 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 65000, burnIn = 45000, saveAt  = "Kernelmu218_", verbose = FALSE)
+
+set.seed(103)
+fit3 <- BGLR(y = y_train, ETA = ETA,
+             nIter = 65000, burnIn = 45000, saveAt  = "Kernelmu318_", verbose = FALSE)
+
+# =========================================================
+# 10. PROMEDIO DE PARÁMETROS
+# =========================================================
+u_G <- (fit1$ETA[[2]]$u + fit2$ETA[[2]]$u + fit3$ETA[[2]]$u) / 3
+u_M <- (fit1$ETA[[3]]$u + fit2$ETA[[3]]$u + fit3$ETA[[3]]$u) / 3
+mu  <- (fit1$mu + fit2$mu + fit3$mu) / 3
+
+# =========================================================
+# 11. PREDICCIÓN
+# =========================================================
+u_pred_G <- K_test_train %*% ginv(K_train) %*% u_G
+u_pred_M <- K_M_test_train %*% ginv(K_M_train) %*% u_M
+
+y_pred <- as.vector(mu + u_pred_G + u_pred_M)
+
+# =========================================================
+# 12. EVALUACIÓN
+# =========================================================
+cor_pred <- cor(y_test, y_pred)
+rmse     <- sqrt(mean((y_test - y_pred)^2))
+
+cat("Cor =", round(cor_pred,4), "\n")
+cat("RMSE =", round(rmse,4), "\n")
+```
+
+
+# Posterior
+```{r}
+# =========================================================
+# NEW POSTERIOR ANALYSIS SECTION (HD & ENGLISH)
+# =========================================================
+library(coda)
+library(bayesplot)
+library(ggplot2)
+
+# Professional palette for 4 MCMC chains
+cols <- c("#FF0FFF", "#00BFFF", "#32CD32", "#FF0000")
+
+# Function to load MCMC and assign names (Prevents "No parameter names found" error)
+load_mcmc_named <- function(pattern, par_name) {
+  c1 <- scan(paste0("Kernelmu118_", pattern), quiet = TRUE)
+  c2 <- scan(paste0("Kernelmu218_", pattern), quiet = TRUE)
+  c3 <- scan(paste0("Kernelmu318_", pattern), quiet = TRUE)
+ 
+  
+  mcmc.list(
+    mcmc(matrix(c1, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c2, ncol = 1, dimnames = list(NULL, par_name))),
+    mcmc(matrix(c3, ncol = 1, dimnames = list(NULL, par_name)))
+  )
+}
+
+# 1. Load Chains
+mu_mcmc  <- load_mcmc_named("mu.dat", "Global_Mean")
+u_mcmc   <- load_mcmc_named("ETA_G_varU.dat", "Additive_Variance_G")
+m_mcmc   <- load_mcmc_named("ETA_M_varU.dat", "Molecular_Variance_M")
+e_mcmc   <- load_mcmc_named("varE.dat", "Residual_Variance_E")
+env_mcmc <- load_mcmc_named("ETA_ENV_varB.dat","Varianza ambiental")
+
+
+
+# =========================================================
+# UNIFICACIÓN DE CADENAS (COMBINAR LAS 4 CADENAS)
+# =========================================================
+# Combinamos las 4 cadenas de cada parámetro en un solo vector
+mu_com <- as.numeric(do.call(rbind, mu_mcmc))
+u_com  <- as.numeric(do.call(rbind, u_mcmc))
+m_com  <- as.numeric(do.call(rbind, m_mcmc))
+e_com  <- as.numeric(do.call(rbind, e_mcmc))
+env_com  <- as.numeric(do.call(rbind, env_mcmc))
+
+cat("\nCadenas unificadas correctamente. Listas para el reescalado.\n")
+
+# 2. List for processing
+params_list <- list(mu_mcmc, u_mcmc, m_mcmc, e_mcmc,env_mcmc)
+file_names   <- c("Trace_Mean24", "Trace_VarG24", "Trace_VarM24",  "Trace_VarE24","Trace_VarEnv24")
+
+
+
+
+
+plot_titles <- list(
+  expression(mu), 
+  expression(sigma[G]^2), 
+  expression(sigma[M]^2), 
+  expression(sigma[e]^2),
+  expression(sigma[env]^2)
+)
+
+# =========================================================
+# 3. BUCLE PARA GUARDAR TRAZAS HD
+# =========================================================
+for(i in 1:length(params_list)){
+  p <- mcmc_trace(params_list[[i]]) + 
+    ggtitle(plot_titles[[i]]) +  # Doble corchete para la expresión
+    scale_color_manual(values = cols) +
+    theme_classic() + 
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 18, hjust = 0.5)
+    ) +
+    labs(x = "Iteration", y = "Value")
+  
+  print(p)
+  
+  ggsave(filename = paste0(file_names[i], ".tiff"), plot = p,
+         width = 8, height = 4.5, dpi = 300, compression = "lzw")
+}
+
+
+```
+
+
+# regresar a escala verdadera
+```{r}
+
+real_mean_mu  <- (mean(mu_com) )
+real_var_G    <- mean(u_com)  
+real_var_M    <- mean(m_com)  
+real_var_E    <- mean(e_com)  
+real_var_E    <- mean(env_com)  
+
+
+# Heritability (Broad-sense h2)
+# Formula: (G + M + GY) / (G + M + GY + E)
+h2_val <- (mean(u_com) + mean(m_com) ) / 
+          (mean(u_com) + mean(m_com)  + mean(e_com))
+
+cat("\n========== RESULTS IN REAL SCALE (t/ha) ==========\n")
+cat("Global Mean:      ", round(real_mean_mu, 3), "t/ha\n")
+cat("Variance G:       ", round(real_var_G, 3), "\n")
+cat("Variance M:       ", round(real_var_M, 3), "\n")
+cat("Variance E:       ", round(real_var_E, 3), "\n")
+cat("--------------------------------------------------\n")
+cat("Heritability (h2):", round(h2_val, 3), "\n")
+cat("==================================================\n")
+```
+
+
+```{r}
+# =========================================================
+library(HDInterval)
+
+# 1. Transformar las cadenas COMPLETAS (vectores, no promedios)
+mu_real_chain  <- (mu_com ) 
+u_real_chain   <- u_com  
+m_real_chain   <- m_com  
+e_real_chain   <- e_com  
+env_real_chain   <- env_com  
+
+h2_chain <- (u_com + m_com ) / (u_com + m_com  + e_com)
+
+
+
+
+summary(h2_chain)
+# 3. Función de cálculo (Mediana y HDI 95%)
+calc_real_stats <- function(chain) {
+  h <- hdi(chain, credMass = 0.95)
+  return(c(Median = median(chain), Lower = h[1], Upper = h[2]))
+}
+
+# 4. Aplicar a las cadenas
+summary_table <- rbind(
+  `Global Mean (mu)`  = calc_real_stats(mu_real_chain),
+  `Variance G`        = calc_real_stats(u_real_chain),
+  `Variance M`        = calc_real_stats(m_real_chain),
+   `Variance Env`        = calc_real_stats(env_real_chain),
+  `Variance E`        = calc_real_stats(e_real_chain),
+  `Heritability (h2)` = calc_real_stats(h2_chain)
+)
+
+colnames(summary_table) <- c("Posterior Median", "95% HDI Lower", "95% HDI Upper")
+
+cat("\n========== CORRECTED POSTERIOR SUMMARY (REAL SCALE) ==========\n")
+print(round(summary_table, 4))
+
+summary(h2_chain)
+```
+
+# Gelma-Rubin
+```{r}
+# =========================================================
+# =========================================================
+library(coda)
+
+
+gr_mu  <- gelman.diag(mu_mcmc)
+gr_u   <- gelman.diag(u_mcmc)
+gr_m   <- gelman.diag(m_mcmc)
+gr_e   <- gelman.diag(e_mcmc)
+gr_env   <- gelman.diag(env_mcmc)
+
+# Extraer el "Point Estimate" que es el valor principal de R-hat
+gr_table <- rbind(
+  `Global Mean (mu)`   = gr_mu$psrf[1, ],
+  `Variance G`         = gr_u$psrf[1, ],
+  `Variance M`         = gr_m$psrf[1, ],
+  `Variance E`         = gr_e$psrf[1, ],
+  `Variance Env`         = gr_env$psrf[1, ])
+
+colnames(gr_table) <- c("Point Est. (R-hat)", "Upper C.I.")
+
+cat("\n========== GELMAN-RUBIN DIAGNOSTIC ==========\n")
+cat("Values close to 1.00 indicate convergence.\n\n")
+print(round(gr_table, 4))
+cat("=============================================\n")
+
+# Interpretación automática
+max_rhat <- max(gr_table[, 1])
+if(max_rhat < 1.1) {
+  cat("Success: All parameters have converged (R-hat < 1.1).\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider increasing nIter.\n")
+}
+```
